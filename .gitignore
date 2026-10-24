@@ -4,4 +4,7 @@ __pycache__/
 .pytest_cache/
 build/
 dist/
-.claude/worktrees/
+.claude/
+.DS_Store
+*.log
+temp/
