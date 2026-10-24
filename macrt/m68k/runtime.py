@@ -702,6 +702,7 @@ class Runner:
         self.internal_error: str | None = None      # the traceback, if macrt failed running it
         self.temp_handles: set[int] = set()         # TempNewHandle's
         self.trace = False
+        self.trace_suppress = ()    # trap names --trace-traps doesn't log
         self.menu_rect = 0          # mbRect's answer while MenuSelect pulls a menu down
         self.retrace_tick = 0       # when its VBL tasks were last counted down
         self.catch_up = 1           # the most ticks the next count makes up for
@@ -1025,7 +1026,9 @@ class Runner:
         self.history.append((word, pc))
         self.screen.tick()          # show what it's written in the screen buffer
         if self.trace:
-            log.debug("%s: %s at $%06X", self.process.name, dispatch.describe(self, word), pc)
+            name = dispatch.describe(self, word)
+            if name not in self.trace_suppress:
+                log.debug("%s: %s at $%06X", self.process.name, name, pc)
         start, end = self.machine.stubs
         via_stub = start <= (pc & ADDRESS_MASK) < end
         if pc & ADDRESS_MASK == self.machine.return_stub:

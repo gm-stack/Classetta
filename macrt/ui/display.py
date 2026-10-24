@@ -297,10 +297,12 @@ class Display(QObject):
                folder: Folder | None = None, trace: bool = False,
                page_option: int = 0, memory: int | None = None,
                as_panel: bool = True, code0: Layout | None = None,
-               finder_info: bytes | None = None) -> Process:
+               finder_info: bytes | None = None,
+               trace_suppress: tuple[str, ...] = ()) -> Process:
         """Start a guest.  app is its application file, if it has one: the
         resource file GetNewWindow, GetMenu and friends read from.  With
-        no Python main, app's own 68k code runs; trace logs its traps.
+        no Python main, app's own 68k code runs; trace logs its traps,
+        except those named in trace_suppress.
         page_option is Launch's, for CurPageOption.  memory, in bytes, is
         in place of the size its SIZE resource asks for: app's memory size,
         as Get Info sets it, so it's the size of app's later launches too
@@ -319,6 +321,7 @@ class Display(QObject):
                        as_panel=as_panel, code0=code0, finder_info=finder_info)
         if proc.runner is not None:
             proc.runner.trace = trace
+            proc.runner.trace_suppress = trace_suppress
         self.launch_order.append(proc)
         self.processes.append(proc)
         self.switch_to(proc)
