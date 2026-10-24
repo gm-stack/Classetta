@@ -27,6 +27,7 @@ import math
 import re
 import signal
 import sys
+import threading
 import time
 
 from PyQt6.QtCore import QTimer
@@ -316,6 +317,11 @@ def parse_args(argv=None):
     ap.add_argument("--system", metavar="FILE",
                     help="a real System file, or a disk image holding one, in place of the "
                          "built-in empty one")
+    ap.add_argument("--script", metavar="FILE",
+                    help="a Python file run against the running display, to drive the "
+                         "applications with synthetic keys and clicks")
+    ap.add_argument("--quit-when-done", action="store_true",
+                    help="with --script, shut down once the script returns")
     args = ap.parse_args(argv)
     if args.memory is not None and args.memory <= 0:
         ap.error("--memory is a size in K, more than 0")
@@ -376,6 +382,33 @@ def open_targets(args):
     return targets, disks, None
 
 
+def _run_script(display, path: str, quit_when_done: bool = False) -> None:
+    """Run a Python file on its own thread, with `macrt` (the Controller)
+    and `display` in its globals.  The GUI thread stays free to draw and
+    answer traps while the script sleeps and waits."""
+    import traceback
+
+    from .ui.automation import Controller
+
+    controller = Controller(display)
+
+    def run():
+        try:
+            with open(path) as f:
+                source = f.read()
+            exec(compile(source, path, "exec"),
+                 {"macrt": controller, "display": display, "__name__": "__script__"})
+        except BaseException:  # noqa: BLE001 - reported, not propagated
+            traceback.print_exc()
+        finally:
+            if quit_when_done:
+                display.shutdown()
+
+    t = threading.Thread(target=run, name="script", daemon=True)
+    t.start()
+
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     targets, disks = [], []
@@ -403,7 +436,8 @@ def main(argv=None) -> int:
                                         system_file=system_file, speed=args.speed,
                                         model=args.model, depth=args.depth,
                                         row_bytes=args.row_bytes, disks=disks,
-                                        sound=not args.no_sound, record_sound=args.record_sound))
+                                        sound=not args.no_sound, record_sound=args.record_sound,
+                                        scripted=bool(args.script)))
     except (OSError, ValueError) as e:      # a screen too big, a WAV file that can't be made
         print(f"macrt: {e}", file=sys.stderr)
         return 2
@@ -424,6 +458,8 @@ def main(argv=None) -> int:
         display.launch("Sampler", sampler_main)
         if not args.single:
             display.launch("Ticker", ticker_main)
+    if args.script:
+        _run_script(display, args.script, quit_when_done=args.quit_when_done)
     signal.signal(signal.SIGINT, lambda *_: display.shutdown())
     heartbeat = QTimer(interval=200)      # lets Python see Ctrl+C
     heartbeat.timeout.connect(lambda: None)
