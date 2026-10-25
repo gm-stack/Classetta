@@ -703,6 +703,7 @@ class Runner:
         self.temp_handles: set[int] = set()         # TempNewHandle's
         self.trace = False
         self.trace_suppress = ()    # trap names --trace-traps doesn't log
+        self.tracer = None          # symtab.FunctionTracer, when one is installed
         self.menu_rect = 0          # mbRect's answer while MenuSelect pulls a menu down
         self.retrace_tick = 0       # when its VBL tasks were last counted down
         self.catch_up = 1           # the most ticks the next count makes up for
@@ -829,6 +830,8 @@ class Runner:
         events = self.process.events
         while True:
             ev = cpu.run(until)
+            if self.tracer is not None:
+                self.tracer.pump()      # hook changes only take here: this thread
             if events.killed:
                 cpu.interrupt_requested = False
                 raise ProcessKilled()

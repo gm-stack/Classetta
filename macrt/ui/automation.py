@@ -86,6 +86,8 @@ class Controller:
         self.d = display
         self._keyboard = display.system.model.keyboard
         self._target = None
+        self._symbols: list[dict] = []
+        self._symbols_meta: dict = {}
 
     # -- time --------------------------------------------------------------
     def sleep(self, seconds: float) -> None:
@@ -210,6 +212,101 @@ class Controller:
         proc = self._proc()
         if proc is not None:
             proc.events.post(EventRecord(mouseUp, 0, 0, d.input.mac_pos, d.input.modifiers))
+
+    # -- symbols, mapping, tracing ----------------------------------------
+    def load_symbols(self, path: str) -> int:
+        """Read a Ghidra symbol table (macrt.symtab's JSON) for the
+        target process to map and trace against.  Returns how many
+        functions it holds."""
+        from .. import symtab
+        self._symbols, self._symbols_meta = symtab.load_symbols(path)
+        return len(self._symbols)
+
+    def extract_symbols(self, ghidra_url: str = "http://127.0.0.1:8080/mcp",
+                        program: str | None = None, path: str | None = None,
+                        progress=None) -> int:
+        """Ask a running Ghidra for every function's name, arguments and
+        return value, and keep them.  The program is picked by matching
+        the running app's jump table, unless named.  Saves to `path`."""
+        from .. import symtab
+        mcp = symtab.GhidraMcp(ghidra_url)
+        if program is None:
+            program = self._pick_program(mcp)
+        table = symtab.extract_symbols(mcp, program, progress)
+        self._symbols = table
+        from .. import symtab as _st
+        self._symbols_meta = {"ghidra": {"program": program, "url": ghidra_url},
+                              "jank_a5": _st.jank_layout(self._proc().app.rsrc).jank_a5}
+        if path:
+            symtab.save_symbols(path, table, self._symbols_meta)
+        return len(table)
+
+    def _pick_program(self, mcp) -> str:
+        """The open Ghidra program that is the target's application."""
+        proc = self._proc()
+        if proc is None or proc.app is None:
+            raise RuntimeError("extract_symbols needs a 68k application")
+        from .. import symtab
+        return symtab.pick_program(mcp, proc.app.rsrc)
+
+    def symbols(self) -> list[dict]:
+        return list(getattr(self, "_symbols", []))
+
+    def map_address(self, ghidra_addr: int):
+        """Where Ghidra's address `ghidra_addr` is in Classetta's memory
+        right now, or None if its segment isn't loaded.  Needs
+        `load_symbols` (or `extract_symbols`) first -- that is what says
+        this application is the one Ghidra looked at."""
+        proc = self._proc()
+        from .. import symtab
+        layout = symtab.jank_layout(proc.app.rsrc)
+        return symtab.AppMap(proc, layout).resolve(ghidra_addr)
+
+    def trace_functions(self, path: str | None = None,
+                        match: tuple[str, ...] = ()) -> int:
+        """Start tracing the target's own functions -- name, arguments,
+        return value -- to a file or stderr.  `match` keeps the log to
+        the routines whose names contain one of these.  The hooks go on
+        as the guest next stops in its event loop; `trace_ready()` says
+        when they're all on.  Returns how many functions were queued."""
+        from .. import symtab
+        if not self._symbols:
+            raise RuntimeError("trace_functions needs a symbol table: "
+                               "load_symbols() or extract_symbols() first")
+        def start():
+            proc = self._proc()
+            out = open(path, "w") if path else None
+            proc._trace_out = out
+            proc._tracer = symtab.symbols_for(proc, self._symbols, self._symbols_meta,
+                                              match, out)
+            return True
+        self.d.bridge.call(start)
+        return len(self._symbols)
+
+    def trace_ready(self) -> bool:
+        """Whether every matched function that lives in memory is hooked."""
+        def check():
+            proc = self._proc()
+            tracer = getattr(proc, "_tracer", None)
+            return tracer is not None and not tracer.pending
+        return self.d.bridge.call(check)
+
+    def trace_stop(self) -> None:
+        def stop():
+            proc = self._proc()
+            if getattr(proc, "_tracer", None) is not None:
+                proc._tracer.uninstall()
+                proc.runner.tracer = None
+                proc._tracer = None
+            out, proc._trace_out = getattr(proc, "_trace_out", None), None
+            if out is not None:
+                out.close()
+        self.d.bridge.call(stop)
+
+    def dump_memory(self, path: str) -> int:
+        """Write the Mac's whole RAM to a file: what's in memory now,
+        the game's loaded code and all.  Returns the byte count."""
+        return self.d.bridge.call(self._proc().dump_memory, path)
 
     # -- looking -------------------------------------------------------------
     def screenshot(self, path: str) -> None:

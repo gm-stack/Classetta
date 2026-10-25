@@ -215,6 +215,31 @@ class Process:
         self.thread = threading.Thread(target=run, name=f"guest:{self.name}", daemon=True)
         self.thread.start()
 
+    def trace_functions(self, table: list, match: tuple[str, ...] = (),
+                        out=None) -> "symtab.FunctionTracer | None":
+        """Trace its own 68k functions -- name, arguments, return value --
+        using the jank-layout map back from Ghidra's addresses.  The
+        table's from macrt.symtab; the hooks go on as the guest stops,
+        so it takes a moment (and its event loop) to arm."""
+        from . import symtab
+        if self.runner is None:
+            raise ValueError(f"{self.name} has no 68k code to trace")
+        if self.app is None:
+            raise ValueError(f"{self.name} has no application file to map")
+        layout = symtab.jank_layout(self.app.rsrc)
+        app_map = symtab.AppMap(self, layout)
+        tracer = symtab.FunctionTracer(self, app_map, table, out, match)
+        tracer.install()
+        self.runner.tracer = tracer
+        return tracer
+
+    def dump_memory(self, path: str) -> int:
+        """Write the whole guest RAM to a file, and say how long it is."""
+        data = bytes(self.system.mem._b)
+        with open(path, "wb") as f:
+            f.write(data)
+        return len(data)
+
     def kill(self) -> None:
         """Stop the application, wherever it is: waiting for an event,
         tracking the mouse, or in the middle of its own code."""
