@@ -233,6 +233,24 @@ class Process:
         self.runner.tracer = tracer
         return tracer
 
+    def patcher(self) -> "inject.FunctionPatcher":
+        """The hook engine for this process's 68k code, made once and
+        kept: hooks, calls and register reads all go through it.  The
+        hooks go on as the guest stops, the same way the tracer's do."""
+        from . import inject
+        if self.runner is None:
+            raise ValueError(f"{self.name} has no 68k code to hook")
+        if self.app is None:
+            raise ValueError(f"{self.name} has no application file to map")
+        existing = getattr(self.runner, "patcher", None)
+        if existing is not None:
+            return existing
+        from . import symtab
+        layout = symtab.jank_layout(self.app.rsrc)
+        patcher = inject.FunctionPatcher(self, symtab.AppMap(self, layout))
+        self.runner.patcher = patcher
+        return patcher
+
     def dump_memory(self, path: str) -> int:
         """Write the whole guest RAM to a file, and say how long it is."""
         data = bytes(self.system.mem._b)

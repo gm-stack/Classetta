@@ -325,6 +325,11 @@ def parse_args(argv=None):
     ap.add_argument("--script", metavar="FILE",
                     help="a Python file run against the running display, to drive the "
                          "applications with synthetic keys and clicks")
+    ap.add_argument("--inject", metavar="FILE",
+                    help="a Python file run against the running display with `mac` in "
+                         "its globals: hook the game's own functions (on entry, on "
+                         "return, replaced outright), call them, and read its memory "
+                         "and registers.  Needs the symbols: --symbols or Ghidra.")
     ap.add_argument("--quit-when-done", action="store_true",
                     help="with --script, shut down once the script returns")
     ap.add_argument("--ghidra-project", metavar="PATH",
@@ -408,22 +413,26 @@ def open_targets(args):
     return targets, disks, None
 
 
-def _run_script(display, path: str, quit_when_done: bool = False) -> None:
-    """Run a Python file on its own thread, with `macrt` (the Controller)
-    and `display` in its globals.  The GUI thread stays free to draw and
-    answer traps while the script sleeps and waits."""
+def _run_script(display, path: str, quit_when_done: bool = False,
+                controller=None) -> None:
+    """Run a Python file on its own thread, with `macrt` (the Controller),
+    `mac` (the same, for injection scripts) and `display` in its globals.
+    The GUI thread stays free to draw and answer traps while the script
+    sleeps and waits."""
     import traceback
 
     from .ui.automation import Controller
 
-    controller = Controller(display)
+    controller = controller or Controller(display)
+    display._controller = controller
 
     def run():
         try:
             with open(path) as f:
                 source = f.read()
             exec(compile(source, path, "exec"),
-                 {"macrt": controller, "display": display, "__name__": "__script__"})
+                 {"mac": controller, "macrt": controller, "display": display,
+                  "__name__": "__script__"})
         except BaseException:  # noqa: BLE001 - reported, not propagated
             traceback.print_exc()
         finally:
@@ -510,7 +519,8 @@ def main(argv=None) -> int:
         print(f"macrt: {e}", file=sys.stderr)
         return 2
     display.show()
-    wanted = bool(args.symbols or args.trace_functions is not None or args.dump_mem)
+    wanted = bool(args.symbols or args.trace_functions is not None or args.dump_mem
+                  or args.inject)
     game = None
     if targets:
         logging.basicConfig(format="macrt: %(message)s")
@@ -562,8 +572,19 @@ def main(argv=None) -> int:
                 print(f"macrt: tracing {len(functions)} functions"
                       f"{' into ' + args.trace_functions if args.trace_functions else ''}"
                       " (hooks go on as the game runs)")
-    if args.script:
-        _run_script(display, args.script, quit_when_done=args.quit_when_done)
+            if args.inject:
+                # Hand the symbols to the controller the script will get,
+                # so it can hook and call by Ghidra name without loading
+                # them again.  One controller for --script and --inject
+                # both, so they see the same hooks and loaded symbols.
+                from .ui.automation import Controller
+                controller = getattr(display, "_controller", None) or Controller(display)
+                controller._symbols, controller._symbols_meta = functions, meta
+                display._controller = controller
+    for path in (args.script, args.inject):
+        if path:
+            _run_script(display, path, quit_when_done=args.quit_when_done,
+                        controller=getattr(display, "_controller", None))
     signal.signal(signal.SIGINT, lambda *_: display.shutdown())
     heartbeat = QTimer(interval=200)      # lets Python see Ctrl+C
     heartbeat.timeout.connect(lambda: None)

@@ -485,6 +485,67 @@ class AppMap:
 # ---------------------------------------------------------------------------
 # Tracing
 # ---------------------------------------------------------------------------
+def _is_return(op: int) -> bool:
+    """RTR, RTE, RTS, RTD #n, JMP (An), JMP (An)+: the ways out."""
+    return op in (0x4E73, 0x4E75, 0x4E77, 0x4ED0, 0x4EE9) or 0x4E78 <= op <= 0x4E7F
+
+
+def return_sites(app_map: "AppMap", sym: dict, entry: int) -> list[int]:
+    """Where the routine can leave: every return-shaped instruction
+    in its body, in live addresses.  Ghidra's body doesn't necessarily
+    end at the RTS -- a routine returns early, or ends in a trap -- so
+    every one of them counts.  The scan stops at the routine's own
+    segment: past it lives its neighbours, whose RTS would read as this
+    one's.  A return-shaped word that's really data inside the body
+    shows up as an extra site; that's the cost, and a small one."""
+    mem = app_map.mem
+    layout = app_map.layout
+    body_end = sym.get("body_end", 0) or 0
+    seg = layout.segment_at(sym["entry"])
+    if seg is not None:                       # keep the body in its segment
+        body_end = min(body_end or seg.jank_base + seg.size - 1,
+                       seg.jank_base + seg.size - 1)
+    end = app_map.resolve(body_end)
+    if end is None or end <= entry:
+        return []
+    try:
+        words = mem.read(entry, min(end - entry + 1, 0x10000))
+    except Exception:                                # noqa: BLE001
+        return []
+    return [entry + i for i in range(0, len(words) - 1, 2)
+            if _is_return(struct.unpack_from(">H", words, i)[0])]
+
+
+def stack_adjust(app_map: "AppMap", sym: dict, entry: int) -> int:
+    """What skipping the routine must clean up beyond the return
+    address: a routine that leaves through RTD #n pops the caller's
+    arguments itself, so a skipped one owes that n too.  The first RTD
+    in the body says the routine's convention; one that returns with
+    RTS, JSR-styled or through a trap cleans nothing up.  (A routine
+    whose exits disagree is a rarity; the first one wins, like the
+    caller's expectation does.)"""
+    mem = app_map.mem
+    layout = app_map.layout
+    body_end = sym.get("body_end", 0) or 0
+    seg = layout.segment_at(sym["entry"])
+    if seg is not None:
+        body_end = min(body_end or seg.jank_base + seg.size - 1,
+                       seg.jank_base + seg.size - 1)
+    end = app_map.resolve(body_end)
+    if end is None or end <= entry:
+        return 0
+    try:
+        words = mem.read(entry, min(end - entry + 1, 0x10000))
+    except Exception:                                # noqa: BLE001
+        return 0
+    for i in range(0, len(words) - 1, 2):
+        if struct.unpack_from(">H", words, i)[0] == 0x4E7A:      # RTD
+            if i + 2 < len(words):
+                return struct.unpack_from(">h", words, i + 2)[0]
+            return 0
+    return 0
+
+
 class FunctionTracer:
     """Hooks every routine the map resolves, and writes what it sees:
     each call's name and arguments as they sit on the stack, and what
@@ -574,35 +635,8 @@ class FunctionTracer:
             self.pending.clear()
             self._drop = True
 
-    @staticmethod
-    def _is_return(op: int) -> bool:
-        """RTR, RTE, RTS, RTD #n, JMP (An), JMP (An)+: the ways out."""
-        return op in (0x4E73, 0x4E75, 0x4E77, 0x4ED0, 0x4EE9) or 0x4E78 <= op <= 0x4E7F
-
     def _return_sites(self, sym: dict, entry: int) -> list[int]:
-        """Where the routine can leave: every return-shaped instruction
-        in its body.  Ghidra's body doesn't necessarily end at the RTS
-        -- a routine returns early, or ends in a trap -- so each one is
-        hooked.  The scan stops at the routine's own segment: past it
-        lives its neighbours, whose RTS would log as this one's.  A
-        return-shaped word that's really data inside the body logs an
-        out-of-place line; that's the cost, and a small one."""
-        mem = self.app_map.mem
-        layout = self.app_map.layout
-        body_end = sym.get("body_end", 0) or 0
-        seg = layout.segment_at(sym["entry"])
-        if seg is not None:                       # keep the body in its segment
-            body_end = min(body_end or seg.jank_base + seg.size - 1,
-                           seg.jank_base + seg.size - 1)
-        end = self.app_map.resolve(body_end)
-        if end is None or end <= entry:
-            return []
-        try:
-            words = mem.read(entry, min(end - entry + 1, 0x10000))
-        except Exception:                                # noqa: BLE001
-            return []
-        return [entry + i for i in range(0, len(words) - 1, 2)
-                if self._is_return(struct.unpack_from(">H", words, i)[0])]
+        return return_sites(self.app_map, sym, entry)
 
     def _fmt(self, mem, sp: int, p: dict, off: int) -> str:
         at = sp + off

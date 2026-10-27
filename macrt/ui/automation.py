@@ -303,6 +303,159 @@ class Controller:
                 out.close()
         self.d.bridge.call(stop)
 
+    # -- hooks: Python on entry, on return, in place --------------------------
+    #
+    # A `target` is a Ghidra name from the loaded symbol table -- exact,
+    # or a substring that matches one function -- or a jank address.
+    # Handlers run on the guest thread with its machine stopped; from
+    # them, `hook.regs()`, `hook.call_original(...)` and the `call`
+    # below all reach the game directly.
+
+    from .. import inject as _inject
+    SKIP = _inject.SKIP
+
+    def _patcher(self):
+        cached = getattr(self, "_patcher_obj", None)
+        proc = self._proc()
+        if cached is not None and cached.process is proc:
+            return cached
+        runner = proc.runner
+        if runner is not None and getattr(runner, "patcher", None) is not None:
+            self._patcher_obj = runner.patcher
+            return runner.patcher
+        # Building it reads the live jump table, so ask the GUI thread
+        # (which, in a scripted run, answers right away).
+        self._patcher_obj = self.d.bridge.call(proc.patcher)
+        return self._patcher_obj
+
+    def find(self, target) -> dict:
+        """The symbol table's row for a name or jank address; a bare
+        address with no symbol gets a row that knows only its entry.
+        Ghidra makes a stub function of each jump table slot under the
+        routine's own name; when both exist, the routine wins -- its
+        body is real, and hooking it covers every call, table or
+        direct."""
+        from .. import inject
+        if isinstance(target, int):
+            for sym in self._symbols:
+                if sym["entry"] == target:
+                    return sym
+            return inject.symbol_at(target)
+        name = str(target)
+        exact = [s for s in self._symbols if s["name"] == name]
+        hits = exact or [s for s in self._symbols if name.lower() in s["name"].lower()]
+        if len(hits) > 1:
+            layout = self._patcher().app_map.layout
+            real = [s for s in hits if not layout.is_jt_slot(s["entry"])]
+            if len(real) == 1:
+                return real[0]
+        if len(hits) == 1:
+            return hits[0]
+        if not hits:
+            raise KeyError(f"no function {name!r} in the symbol table")
+        raise KeyError(f"{name!r} matches {len(hits)} functions: "
+                       + ", ".join(sorted(s["name"] for s in hits)[:8]) + "...")
+
+    def hook(self, target, phase: str = "replace"):
+        """A decorator hooking one function.
+
+            @mac.hook("math_Abs16", phase="replace")
+            def abs16(h):                  # h.args, h.regs()
+                return abs(h.args[0])      # becomes the return value
+
+        Phases: "enter" (before the body; return mac.SKIP to skip it),
+        "return" (h.value is the return value; assign to change it),
+        "replace" (the body never runs).  The decorated function is
+        returned unchanged, carrying `.unhook()`.  The hook goes on as
+        the guest next stops -- `hooks_ready()` says when."""
+        sym = self.find(target)
+        from .. import inject
+
+        def decorate(fn):
+            fh = self._patcher().hook(sym, phase, fn)
+            fn.unhook = fh.uninstall
+            fn.hook = fh
+            return fn
+        return decorate
+
+    def unhook(self, target) -> int:
+        """Take the hooks off a function -- by the decorated name or
+        the function itself.  Returns how many came off."""
+        fn = target
+        name = getattr(fn, "__name__", None)
+        if isinstance(target, str):
+            name = self.find(target)["name"]
+        patcher = self._patcher()
+        hits = [fh for fh in patcher.hooks
+                if fh.handler is fn or (name and fh.name == name)]
+        for fh in hits:
+            fh.uninstall()
+        return len(hits)
+
+    def hooks_ready(self) -> bool:
+        """Whether every hook that's been made is on (a hook on a
+        segment not loaded yet stays pending)."""
+        return self._patcher().ready()
+
+    def hooks_pending(self) -> list[str]:
+        return [fh.name for fh in self._patcher().pending]
+
+    # -- memory, by label or Ghidra address -----------------------------------
+    def resolve(self, target) -> int:
+        """Where a Ghidra name or jank address is in live memory now.
+        Raises if its segment isn't loaded."""
+        sym = self.find(target) if not isinstance(target, int) else None
+        addr = sym["entry"] if sym is not None else target
+        live = self._patcher().app_map.resolve(addr)
+        if live is None:
+            what = sym["name"] if sym is not None else f"{addr:#x}"
+            raise LookupError(f"{what} isn't loaded right now")
+        return live
+
+    def read(self, target, n: int) -> bytes:
+        return self._patcher().mem.read(self.resolve(target), n)
+
+    def write(self, target, data: bytes) -> None:
+        self._patcher().mem.write(self.resolve(target), data)
+
+    def peek(self, target, size: int = 4) -> int:
+        mem = self._patcher().mem
+        at = self.resolve(target)
+        return {1: mem.r8, 2: mem.r16, 4: mem.r32}[size](at)
+
+    def poke(self, target, value: int, size: int = 4) -> None:
+        mem = self._patcher().mem
+        at = self.resolve(target)
+        {1: mem.w8, 2: mem.w16, 4: mem.w32}[size](at, value)
+
+    # -- the registers, and calls into the game ---------------------------------
+    def regs(self) -> dict:
+        """d0-d7, a0-a6, sp, pc, sr.  The game must be stopped to look:
+        inside a hook handler it is; from the script thread, only while
+        it's waiting.  `call_async` runs on the guest thread, where it's
+        always possible."""
+        return self._patcher().regs()
+
+    def call(self, target, args=(), result: str | None = None):
+        """Call a game function and get its answer back.  `args` are
+        Python values, pushed as the Ghidra signature says; `result`
+        overrides how the answer comes back (a Ghidra format, a
+        register like "d3", "" for raw D0).  Refuses while the game is
+        running its own code -- use it inside a hook handler, from
+        `call_async`, or while it's waiting."""
+        sym = self.find(target)
+        live = self._patcher().app_map.resolve(sym["entry"])
+        if live is None:
+            raise LookupError(f"{sym['name']} isn't loaded right now")
+        if result is None:
+            result = (sym.get("return") or {}).get("format", "")
+        return self._patcher().call(live, sym.get("params", []), tuple(args), result)
+
+    def call_async(self, fn) -> None:
+        """Run fn on the game's own thread at its next stop: inside it,
+        `regs()` and `call()` always work.  Doesn't wait."""
+        self._patcher().async_call(fn)
+
     def dump_memory(self, path: str) -> int:
         """Write the Mac's whole RAM to a file: what's in memory now,
         the game's loaded code and all.  Returns the byte count."""

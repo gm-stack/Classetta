@@ -704,6 +704,7 @@ class Runner:
         self.trace = False
         self.trace_suppress = ()    # trap names --trace-traps doesn't log
         self.tracer = None          # symtab.FunctionTracer, when one is installed
+        self.patcher = None         # inject.FunctionPatcher, when hooks are on
         self.menu_rect = 0          # mbRect's answer while MenuSelect pulls a menu down
         self.retrace_tick = 0       # when its VBL tasks were last counted down
         self.catch_up = 1           # the most ticks the next count makes up for
@@ -750,6 +751,9 @@ class Runner:
             where = (f" in {dispatch.trap_name(self.history[-1][0])}" if self.history else "")
             self._report(SystemError68k(0, f"{type(e).__name__}{where}: {e}"))
         finally:
+            if self.patcher is not None:
+                self.patcher.shutdown()     # no hook outlives its application
+                self.patcher = None
             glue_process.free_temp_memory(self)
             glue_devices.forget(self)
             glue_components.forget(self)
@@ -832,6 +836,10 @@ class Runner:
             ev = cpu.run(until)
             if self.tracer is not None:
                 self.tracer.pump()      # hook changes only take here: this thread
+            if self.patcher is not None:
+                self.patcher.pump()     # so do the Python hooks: entry stops
+                                        # wait for this turn, and don't end
+                                        # until it's had it
             if events.killed:
                 cpu.interrupt_requested = False
                 raise ProcessKilled()
