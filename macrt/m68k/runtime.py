@@ -704,6 +704,7 @@ class Runner:
         self.trace = False
         self.trace_suppress = ()    # trap names --trace-traps doesn't log
         self.tracer = None          # symtab.FunctionTracer, when one is installed
+        self._trace_app_map = None  # the trap trace's map, made on first need
         self.patcher = None         # inject.FunctionPatcher, when hooks are on
         self.menu_rect = 0          # mbRect's answer while MenuSelect pulls a menu down
         self.retrace_tick = 0       # when its VBL tasks were last counted down
@@ -1036,10 +1037,15 @@ class Runner:
             wdefs.refresh(self)     # windows its own WDEFs are to shape and draw
         self.history.append((word, pc))
         self.screen.tick()          # show what it's written in the screen buffer
+        # The arguments are read here, before the trap pops them; the
+        # answer is gathered after it runs and the whole line goes out
+        # at once, in the same shape as the application's own traced
+        # calls.
+        sig = call_text = None
         if self.trace:
-            name = dispatch.describe(self, word)
-            if name not in self.trace_suppress:
-                log.debug("%s: %s at $%06X", self.process.name, name, pc)
+            sig, name, call_text = dispatch.shape(self, word)
+            if name in self.trace_suppress:
+                call_text = None
         start, end = self.machine.stubs
         via_stub = start <= (pc & ADDRESS_MASK) < end
         if pc & ADDRESS_MASK == self.machine.return_stub:
@@ -1060,10 +1066,16 @@ class Runner:
             if patch is not None:
                 if not word & 0x400:
                     cpu.push32(pc + 2)
+                if call_text is not None:
+                    # The patch is the application's own code: what comes
+                    # back is its business, and this can't see it.
+                    self._trace_line(f"{call_text} -> patched ${patch:X}"
+                                     f" (called from {self._where(pc)})")
                 cpu.pc = patch
                 return
             cpu.pc = cpu.pop32() if word & 0x400 else pc + 2
             self._dispatch(word, pc)
+            self._trace_trap(sig, call_text, pc)
             return
         if via_stub:
             # Called through its address: the flags are in D1, if anywhere.
@@ -1072,11 +1084,55 @@ class Runner:
         else:
             patch = self.patches.get(key)
             if patch is not None:
+                if call_text is not None:
+                    self._trace_line(f"{call_text} -> patched ${patch:X}"
+                                     f" (called from {self._where(pc)})")
                 self._call_os_patch(patch, word, pc + 2)
                 return
         cpu.pc = pc + 2
         self._dispatch(word, pc)
         cpu.set_cc_from_word(cpu.d(0))
+        self._trace_trap(sig, call_text, pc)
+
+    def _trace_line(self, text: str) -> None:
+        line = f"{self.process.name}: trap {text}"
+        tracer = self.tracer
+        if tracer is not None:
+            tracer.log(line)            # the app trace's writer, so lines mix in order
+        else:
+            log.debug(line)
+
+    def _trace_trap(self, sig, call_text, pc: int) -> None:
+        if call_text is None:
+            return
+        value = dispatch.result_text(self, sig)
+        self._trace_line(f"{call_text}{(' -> ' + value) if value else ''}"
+                         f" (called from {self._where(pc)})")
+
+    def _where(self, pc: int) -> str:
+        """Where a live address is, in both worlds the trace speaks:
+        the address the guest ran at, where that byte sits in Ghidra's
+        dump, and -- when a function tracer has a symbol table -- the
+        routine around it."""
+        tracer = self.tracer
+        if tracer is not None:
+            return tracer.where(pc)
+        live = f"${pc & ADDRESS_MASK:06X}"
+        ghidra = self.trace_map().ghidra_at(pc) if self.process.app is not None else None
+        return f"{live} / ram:{ghidra:08X}" if ghidra is not None else live
+
+    def trace_map(self):
+        """The map from live addresses to the application's dump, made
+        once and kept: the function tracer brings its own, and one for
+        the trap trace alone is built from the app's resources."""
+        tracer = self.tracer
+        if tracer is not None:
+            return tracer.app_map
+        if getattr(self, "_trace_app_map", None) is None:
+            from .. import symtab
+            self._trace_app_map = symtab.AppMap(
+                self.process, symtab.jank_layout(self.process.app.rsrc))
+        return self._trace_app_map
 
     def _vectored_trap(self) -> None:
         """The ROM's A-line dispatcher, jumped to as through vector $28,

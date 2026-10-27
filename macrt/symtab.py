@@ -27,6 +27,7 @@ name, its arguments as they pass on the stack, and what it returns.
 
 from __future__ import annotations
 
+import bisect
 import json
 import re
 import struct
@@ -481,6 +482,30 @@ class AppMap:
         at = self.resolve(addr)
         return None if at is None else self.mem.read(at, n)
 
+    def ghidra_at(self, live_addr: int) -> int | None:
+        """The dump address behind a live one, for the trace: where the
+        byte the guest ran at sits in Ghidra's image, or None when it's
+        outside the application (system code, a heap thunk)."""
+        addr = live_addr & ADDRESS_MASK
+        if addr < SYSTEM_RAM_SIZE:
+            return addr                         # low memory: the same place
+        layout = self.layout
+        # Which piece of the application is it, by where the loader put
+        # that piece: invert the map's segment deltas.
+        for seg in layout.segments:
+            base = self.bases.get(seg.id)
+            if base is not None and base <= addr < base + seg.size:
+                return seg.jank_base + (addr - base)
+        below_lo = self.live_a5 - layout.below_a5
+        if below_lo <= addr < self.live_a5:
+            return layout.jank_a5 - layout.below_a5 + (addr - below_lo)
+        if self.live_a5 <= addr < self.live_a5 + JT_OFFSET + layout.jt_size:
+            return layout.jank_a5 + (addr - self.live_a5)
+        if self.strs_live is not None and \
+                self.strs_live <= addr < self.strs_live + len(layout.strs):
+            return layout.strs_base + (addr - self.strs_live)
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Tracing
@@ -567,11 +592,28 @@ class FunctionTracer:
         self.out = out or sys.stderr
         self.match = tuple(match)
         self.depth = 0
+        self._calls: list[str] = []               # call lines awaiting their return
         self.pending: list[dict] = []             # symbols waiting to be hooked
         self._handles: list = []
         self._installed: set[int] = set()         # jank entries hooked
         self._drop = False                        # uninstall queued
         self._qlock = threading.Lock()            # the queue: any thread, pump's thread
+        # A sorted index of the table for naming addresses: the routine
+        # whose entry is the greatest one at or below an address, if the
+        # address is inside its body.
+        self._syms = sorted((s["entry"], s.get("body_end") or 0, s["name"])
+                            for s in table if s.get("entry"))
+
+    def symbol_at(self, addr: int) -> str | None:
+        """`Name` or `Name+offset` for an address in the dump, or None
+        when the table knows no routine it sits in (data, or code
+        Ghidra never made a function of)."""
+        i = bisect.bisect_right(self._syms, (addr, 0xFFFFFFFF, "")) - 1
+        if i >= 0:
+            entry, body_end, name = self._syms[i]
+            if entry <= addr < body_end:
+                return name if addr == entry else f"{name}+{addr - entry:X}"
+        return None
 
     def _wanted(self, sym: dict) -> bool:
         if not self.match:
@@ -635,6 +677,13 @@ class FunctionTracer:
             self.pending.clear()
             self._drop = True
 
+    def log(self, line: str) -> None:
+        """A line from elsewhere in the runtime (a trap trace) onto the
+        trace's own writer, so the two kinds interleave in order."""
+        self.out.write(line + "\n")
+        if hasattr(self.out, "flush"):
+            self.out.flush()
+
     def _return_sites(self, sym: dict, entry: int) -> list[int]:
         return return_sites(self.app_map, sym, entry)
 
@@ -655,6 +704,18 @@ class FunctionTracer:
         except Exception:                                # noqa: BLE001
             return "?"
 
+    def where(self, live_addr: int) -> str:
+        """Where a live address is, in both worlds the trace speaks:
+        the address the guest ran at, where that byte sits in Ghidra's
+        dump, and -- when the table knows it -- the routine around it."""
+        live = f"${live_addr & ADDRESS_MASK:06X}"
+        ghidra = self.app_map.ghidra_at(live_addr)
+        if ghidra is None:
+            return live
+        where = f"{live} / ram:{ghidra:08X}"
+        sym = self.symbol_at(ghidra)
+        return f"{where} @ {sym}" if sym else where
+
     def _enter(self, uc, addr, _size, sym) -> None:
         mem = self.app_map.mem
         try:
@@ -667,8 +728,11 @@ class FunctionTracer:
             args.append(f"{p['name']}={self._fmt(mem, sp, p, off)}" if p["name"]
                         else self._fmt(mem, sp, p, off))
             off += (p["length"] + 1) & ~1
-        pad = "  " * min(self.depth, 24)
-        self.out.write(f"{pad}{sym['name']}({', '.join(args)})\n")
+        try:
+            caller = f" (called from {self.where(mem.r32(sp))})"
+        except Exception:                                # noqa: BLE001
+            caller = ""
+        self._calls.append((f"{sym['name']}({', '.join(args)})", caller))
         self.depth += 1
 
     def _exit(self, uc, addr, _size, sym) -> None:
@@ -676,14 +740,32 @@ class FunctionTracer:
         ret = sym.get("return", {})
         fmt = ret.get("format", "x")
         try:
-            reg = cpu.a(0) if fmt == "p" else cpu.d(0)
-            value = (f"{reg:#x}" if fmt in ("p", "I", "x")
-                     else str(struct.unpack(">f", struct.pack(">I", reg & 0xFFFFFFFF))[0]
-                              if fmt == "f" else reg & 0xFFFFFFFF))
+            reg = cpu.a(0) if fmt == "p" else cpu.d(0) & 0xFFFFFFFF
+            if fmt in ("p", "I", "x"):
+                value = f"{reg:#x}"
+            elif fmt == "f":
+                value = f"{struct.unpack('>f', struct.pack('>I', reg))[0]:g}"
+            elif fmt == "i":            # Ghidra's int is signed: -1, not 4294967295
+                value = str(reg - 0x100000000 if reg & 0x80000000 else reg)
+            elif fmt in ("b", "B", "h", "H"):
+                value = str(struct.unpack(">" + fmt,
+                                          struct.pack(">I", reg)[4 - struct.calcsize(">" + fmt):])[0])
+            else:
+                value = str(reg)
         except Exception:                                # noqa: BLE001
             value = "?"
         self.depth = max(0, self.depth - 1)
-        pad = "  " * min(self.depth, 24)
-        self.out.write(f"{pad}-> {sym['name']}: {value}\n")
+        # The call is waiting on its return: merge them into one line,
+        # the answer first and the call site last, as the trap trace
+        # writes its own.  A call entered before the hooks went on has
+        # no line; log the bare return for it.
+        call = caller = None
+        for i in range(len(self._calls) - 1, -1, -1):
+            if self._calls[i][0].startswith(sym["name"] + "("):
+                call, caller = self._calls.pop(i)
+                break
+        if call is None:
+            call, caller = f"{sym['name']}(?)", ""
+        self.out.write(f"{self.process.name}: func {call} -> {value}{caller}\n")
         if self.depth == 0 and hasattr(self.out, "flush"):
             self.out.flush()

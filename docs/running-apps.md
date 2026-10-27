@@ -184,7 +184,7 @@ For example, Vector 2.5, a small program from the Info-Mac archive:
 ```sh
 $ curl -O https://ftp.funet.fi/pub/mac/info-mac/game/arc/vector-25.hqx
 $ python -m macrt vector-25.hqx
-macrt: vector-25.hqx is a StuffIt archive: unpack it first, for example with The Unarchiver (unar vector-25.hqx)
+  vector-25.hqx is a StuffIt archive: unpack it first, for example with The Unarchiver (unar vector-25.hqx)
 $ unar vector-25.hqx
 $ ls "vect_250 folder"
 Vector 2.5 Doc  Vector 2.5.rsrc
@@ -210,7 +210,7 @@ several applications without `--app`, and macrt lists them:
 
 ```
 $ python -m macrt mac6-0-8.dsk
-macrt: mac6-0-8.dsk holds 7 applications; pick one with --app:
+  mac6-0-8.dsk holds 7 applications; pick one with --app:
   Mac System 6.0.8:Applications:Microsoft Excel:Microsoft Excel
   Mac System 6.0.8:Games:Creepy Castle:Creepy Castle™
   Mac System 6.0.8:Games:Operation Tsunami:Operation Tsuanmi
@@ -493,7 +493,7 @@ dialogs rather than a printer driver's:
 When the PDF is written, macrt says so:
 
 ```
-macrt: printed 2 pages to /home/you/Untitled.pdf
+  printed 2 pages to /home/you/Untitled.pdf
 ```
 
 The printer says it's an ImageWriter that prints at 72 dots per inch, so
@@ -954,7 +954,7 @@ Memory Manager to the Sound Manager, and lists what isn't there yet.
 ### A call macrt doesn't implement
 
 ```
-macrt: MyApp: SetDeskCPat (trap $AA47) isn't implemented; skipped
+  MyApp: SetDeskCPat (trap $AA47) isn't implemented; skipped
 ```
 
 The routine is known but has nothing behind it yet: here `SetDeskCPat`,
@@ -967,7 +967,7 @@ missing call is reported only once. When the application quits, macrt
 counts them up:
 
 ```
-macrt: MyApp called traps macrt doesn't implement: SetDeskCPat (1), HMGetHelpMenuHandle (1)
+  MyApp called traps macrt doesn't implement: SetDeskCPat (1), HMGetHelpMenuHandle (1)
 ```
 
 That list is the most useful thing to report: it says exactly what an
@@ -980,7 +980,7 @@ and shows the classic system error alert. The other applications keep
 running. The terminal gets the details:
 
 ```
-macrt: MyApp stopped: system error 3 (illegal instruction): at $00002A
+  MyApp stopped: system error 3 (illegal instruction): at $00002A
   PC 0000002A  SR 2000
   D0-D7 00000000 0000000C 00000000 00000000 00000000 00000000 00000000 00000000
   A0-A7 00000000 00084A10 00000000 00000000 00000000 001840F8 0017FE40 0017FE2C
@@ -1015,15 +1015,21 @@ went on with a value that call should have filled in.
 
 ### Looking closer
 
-- `--trace-traps` logs every trap as it's called, with the address it was
-  called from. Use it to see what an application was doing before it
+- `--trace-traps` logs every trap as it's called: its arguments, what it
+  answered, and the address it was called from -- the live address and,
+  when the application's dump is known, the same byte in Ghidra's
+  `ram:` image. Use it to see what an application was doing before it
   stopped, or why it's sitting still. A package call is logged with the
   routine it's for, by Apple's name:
 
   ```
-  macrt: Fly Swatter: FP68K FMULS at $1033F6
-  macrt: Microsoft Excel: IUMagString at $1193A6
+  F/A-18 Hornet: trap GetNewWindow($C048, $59F16A, $FFFFFFFF) -> $5F9250 (called from $192E0C / ram:00013A72)
+  Fly Swatter: trap FP68K FMULS(?) -> $40000000 (called from $1033F6)
+  Microsoft Excel: trap IUMagString(?) -> patched $5A2110 (called from $1193A6)
   ```
+  A trap's arguments show when the interfaces describe them; a `@raw`
+  package or a patched trap shows `(?)` or `-> patched $...` when the
+  answer is the application's own code's to give.
 - `--view` shows the application's menus, windows and dialogs from its
   resources without running any code. If you mainly want to see what an
   application looked like, this always works.

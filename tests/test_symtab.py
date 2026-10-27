@@ -22,6 +22,7 @@ tracer, which arms while the loop runs, logs AddTwo and Twice but not
 main's own entry.
 """
 
+import re
 import struct
 
 import pytest
@@ -255,13 +256,14 @@ def test_tracer_logs_arguments_and_returns(harness, jank_fixture, tmp_path):
     log = tmp_path / "trace.log"
     out = open(log, "w")
     tr = symtab.symbols_for(proc, table(lay), {"jank_a5": lay.jank_a5}, (), out)
-    h.wait_until(lambda: "Twice(param_1=3)" in log.read_text(), timeout=5,
+    h.wait_until(lambda: "func Twice(param_1=3)" in log.read_text(), timeout=5,
                  what="Twice traced")
     text = log.read_text()
-    assert "AddTwo(param_1=3, param_2=2)" in text
-    assert "-> AddTwo: 5" in text
-    assert "-> Twice: 6" in text
-    assert "main" not in text
+    assert re.search(r"SymFix: func AddTwo\(param_1=3, param_2=2\) -> 5 "
+                     r"\(called from \$[0-9A-F]{6} / ram:[0-9A-F]{8} @ main\+2C\)", text)
+    assert re.search(r"SymFix: func Twice\(param_1=3\) -> 6 "
+                     r"\(called from \$[0-9A-F]{6} / ram:[0-9A-F]{8} @ main\+3A\)", text)
+    assert "main" not in text.replace("@ main", "")
     tr.uninstall()
     h.wait_until(lambda: not tr.pending and not tr._handles, timeout=5,
                  what="the hooks to come off")
@@ -312,7 +314,36 @@ def test_controller_flow(harness, jank_fixture, tmp_path):
     log = tmp_path / "trace.log"
     ctl.trace_functions(str(log), ("AddTwo",))
     ctl.wait(ctl.trace_ready, timeout=5)
-    ctl.wait(lambda: "AddTwo(param_1=3, param_2=2)" in log.read_text(), timeout=5)
-    assert "-> AddTwo: 5" in log.read_text()
+    ctl.wait(lambda: re.search(
+        r"func AddTwo\(param_1=3, param_2=2\) -> 5 "
+        r"\(called from \$[0-9A-F]{6} / ram:[0-9A-F]{8} @ main\+[0-9A-F]+\)",
+        log.read_text()), timeout=5)
     assert "Twice" not in log.read_text()        # the filter held
     ctl.trace_stop()
+
+
+def test_trap_trace_shaped_like_the_function_trace(harness, jank_fixture, caplog):
+    """--trace-traps logs `Name(args) -> value (called from $live /
+    ram:jank)`: the WaitNextEvent at MAIN's $50 answers with its
+    event mask, and the call site names both worlds -- the live
+    address the guest ran at, and the same byte in Ghidra's dump."""
+    import logging
+    import re
+
+    h = harness()
+    proc = launch_fixture(h)
+    lay = jank_fixture
+    with caplog.at_level(logging.DEBUG, logger="macrt.m68k"):
+        proc.runner.trace = True
+        h.wait_until(
+            lambda: any("trap WaitNextEvent(" in r.message
+                        for r in caplog.records), timeout=5,
+            what="the trap traced")
+    proc.runner.trace = False
+    line = next(r.message for r in caplog.records
+                if "trap WaitNextEvent(" in r.message)
+    m = re.search(r"SymFix: trap WaitNextEvent\(-1, \$[0-9A-F]+, 30, \$0\) "
+                  r"-> ([01]) \(called from \$([0-9A-F]{6}) / ram:([0-9A-F]{8})\)", line)
+    assert m, line
+    jank = int(m.group(3), 16)
+    assert jank == lay.segments[0].jank_base + 0x50      # MAIN's own TRAP word

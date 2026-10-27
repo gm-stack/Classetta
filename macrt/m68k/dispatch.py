@@ -541,22 +541,121 @@ def _routine(location: str, table: dict[int, Signature], sel: int) -> Signature 
     return sig
 
 
+def _arg_base(t, word: int) -> int:
+    """Where a trap's stack arguments sit while its instruction runs:
+    an auto-pop trap was reached by a JSR to glue, and the return
+    address is still on top of them."""
+    return t.cpu.sp + (4 if is_toolbox(word) and word & 0x400 else 0)
+
+
+def _resolve(t, word: int, sp: int) -> Signature | None:
+    """The signature of the trap about to be dispatched: a package's
+    routine picked by its selector, else the trap's own."""
+    key = trap_key(word)
+    if key in RAW:
+        return None                 # the handler works the registers itself
+    sig = BY_TRAP.get(key)
+    if sig is None:
+        d = DISPATCHERS.get(key)
+        if d is not None:
+            sig = _routine(d[1], d[2], _read_selector(t, d[1], word, sp)[0])
+    return sig
+
+
+def _fmt_val(v, code: str) -> str:
+    """A value already decoded by its trap code, for the trace: signed
+    numbers decimal, pointers and unsigned longs hex, a Point as a pair."""
+    if v is None or v is Ellipsis:
+        return "?"
+    if isinstance(v, Point):
+        return f"({v.h},{v.v})"
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if hasattr(v, "addr"):
+        return f"${v.addr:X}"
+    if code in "pL":
+        return f"${int(v) & 0xFFFFFFFF:X}"
+    return str(v)
+
+
+def _shape_args(t, word: int, sig: Signature, sp: int) -> list[str]:
+    args = []
+    if sig.stack:
+        try:
+            vals, _ = pop_args(t.mem, sp, sig.stack)
+        except BusError:
+            vals = [Ellipsis] * len(sig.stack)
+        args += [_fmt_val(v, c) for v, c in zip(vals, sig.stack)]
+    for reg, code in sig.regs:
+        if reg.startswith("Out<"):
+            continue
+        try:
+            v = _read_reg(t.cpu, reg, code, word)
+        except BusError:
+            v = Ellipsis
+        args.append(f"{reg}={_fmt_val(v, code)}")
+    return args
+
+
+def shape(t, word: int) -> tuple[Signature | None, str, str]:
+    """(signature or None, name, `Name(arg, arg, ...)`) for the trap
+    trace, read where the trap instruction sits -- before its arguments
+    are popped.  A trap the interfaces don't describe (or that a @raw
+    handler works itself) has no shape to read: it shows `Name(?)`."""
+    name = NAMERS.get(trap_key(word))
+    if name is not None:
+        try:
+            n = name(t.mem, _arg_base(t, word))
+        except BusError:
+            n = trap_name(word)
+        return None, n, f"{n}(?)"
+    sig = None
+    try:
+        sig = _resolve(t, word, _arg_base(t, word))
+    except BusError:        # a stack pointer it can't read from: just the trap
+        pass
+    if sig is None:
+        n = trap_name(word)
+        return None, n, f"{n}(?)"
+    return sig, sig.name, f"{sig.name}({', '.join(_shape_args(t, word, sig, _arg_base(t, word)))})"
+
+
+def result_text(t, sig: Signature | None) -> str:
+    """What the trap answered, once it has run: from its result
+    register, or from the stack slot a Pascal call leaves it in.  ''
+    for a routine that answers nothing; '?' for one whose answer we
+    can't read or don't have a signature for."""
+    if sig is None:
+        return f"${t.cpu.d(0):X}"
+    if not sig.result:
+        return ""
+    try:
+        if sig.result_reg == "D0Minus1Boolean":
+            return "1" if not t.cpu.d(0) else "0"
+        if sig.os_style or sig.result_reg:
+            reg = sig.result_reg or "D0"
+            return _fmt_val(_read_reg(t.cpu, reg, sig.result, 0), sig.result)
+        at = t.cpu.sp
+        code = sig.result
+        if code in "hH":
+            v = t.mem.r16s(at) if code == "h" else t.mem.r16(at)
+        elif code in "bB":
+            v = t.mem.r8s(at) if code == "b" else t.mem.r8(at)
+        elif code == "P":
+            v = Point(_sign16(t.mem.r16(at)), _sign16(t.mem.r16(at + 2)))
+        elif code in "lE":
+            v = t.mem.r32s(at)
+        else:
+            v = t.mem.r32(at)
+        return _fmt_val(v, code)
+    except BusError:
+        return "?"
+
+
 def describe(t, word: int) -> str:
     """The trace's name for a trap about to be dispatched: for a package,
     the routine its selector picks."""
-    key = trap_key(word)
-    sp = t.cpu.sp + (4 if is_toolbox(word) and word & 0x400 else 0)
-    try:
-        if key in NAMERS:
-            return NAMERS[key](t.mem, sp)
-        d = DISPATCHERS.get(key)
-        if d is not None and key not in RAW and key not in BY_TRAP:
-            sig = _routine(d[1], d[2], _read_selector(t, d[1], word, sp)[0])
-            if sig is not None:
-                return sig.name
-    except BusError:        # a stack pointer it can't read from: just the trap
-        pass
-    return trap_name(word)
+    return shape(t, word)[1]
 
 
 def dispatch(t, word: int, pc: int) -> None:

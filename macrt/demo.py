@@ -523,7 +523,7 @@ def main(argv=None) -> int:
                   or args.inject)
     game = None
     if targets:
-        logging.basicConfig(format="macrt: %(message)s")
+        logging.basicConfig(format="%(message)s")
         logging.getLogger("macrt").setLevel(logging.DEBUG if args.trace_traps else logging.INFO)
         try:
             for f, view in targets:
