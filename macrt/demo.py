@@ -34,7 +34,7 @@ import time
 from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication
 
-from . import symtab
+from . import ansi, symtab
 from .m68k.segload import has_code, why_no_code
 from .macfile import is_control_panel, open_application, open_disks
 from .resfork import is_fork
@@ -344,12 +344,16 @@ def parse_args(argv=None):
     ap.add_argument("--symbols", metavar="FILE",
                     help="the symbol table file: read it if it's there, otherwise ask "
                          "Ghidra and save it there")
-    ap.add_argument("--trace-functions", metavar="FILE", nargs="?", const="",
+    ap.add_argument("--trace-functions", action="store_true",
                     help="log the application's own function calls -- name, arguments, "
-                         "return value -- to FILE (or here); needs --symbols")
+                         "return value -- here; needs --symbols")
     ap.add_argument("--trace-match", metavar="NAMES", default="",
                     help="only trace functions whose name contains one of these "
                          "comma-separated strings")
+    ap.add_argument("--log", metavar="FILE",
+                    help="write everything -- the log and the traces along with it "
+                         "-- to FILE as well as the screen (colour stays on the "
+                         "screen; FILE gets plain text)")
     ap.add_argument("--dump-mem", metavar="FILE",
                     help="write the Mac's whole RAM to FILE once the application "
                          "has loaded")
@@ -454,13 +458,14 @@ def _get_symbols(args, app, progress=None) -> tuple[list[dict], dict] | None:
     table matches the application's, unless --ghidra-program says."""
     if args.symbols and os.path.exists(args.symbols):
         return symtab.load_symbols(args.symbols)
+    log = logging.getLogger("macrt")
     try:
         mcp = symtab.GhidraMcp(args.ghidra_mcp)
     except Exception as e:                                       # noqa: BLE001
-        print(f"macrt: {e}", file=sys.stderr)
+        log.error("%s", e)
         return None
     program = args.ghidra_program or symtab.pick_program(mcp, app.rsrc)
-    print(f"macrt: reading symbols from Ghidra program {program!r}...")
+    log.info("reading symbols from Ghidra program %r...", program)
     table = symtab.extract_symbols(mcp, program, progress)
     meta = {"ghidra": {"program": program, "url": args.ghidra_mcp,
                        "project": args.ghidra_project},
@@ -468,7 +473,7 @@ def _get_symbols(args, app, progress=None) -> tuple[list[dict], dict] | None:
             "jank_a5": symtab.jank_layout(app.rsrc).jank_a5}
     if args.symbols:
         symtab.save_symbols(args.symbols, table, meta)
-        print(f"macrt: {len(table)} functions saved to {args.symbols}")
+        log.info("%d functions saved to %s", len(table), args.symbols)
     return table, meta
 
 
@@ -488,11 +493,17 @@ def _wait_loaded(app, display, timeout: float = 60.0) -> bool:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    # The log from the first moment: the screen takes it coloured, and
+    # --log's file takes every line plain.  Either trace is DEBUG, which
+    # is where trace lines are written.
+    ansi.setup(args.log, logging.DEBUG
+               if args.trace_traps or args.trace_functions else logging.INFO)
+    log = logging.getLogger("macrt")
     targets, disks = [], []
     if args.file:
         targets, disks, error = open_targets(args)
         if error:
-            print(f"macrt: {error}", file=sys.stderr)
+            log.error(error)
             return 2
         if args.list:
             return 0
@@ -501,7 +512,7 @@ def main(argv=None) -> int:
         try:
             system_file = open_application(args.system, "System")
         except (OSError, ValueError) as e:
-            print(f"macrt: {e}", file=sys.stderr)
+            log.error(e)
             return 2
     app = QApplication.instance() or QApplication(sys.argv[:1])
     from .ui import theme
@@ -519,12 +530,10 @@ def main(argv=None) -> int:
         print(f"macrt: {e}", file=sys.stderr)
         return 2
     display.show()
-    wanted = bool(args.symbols or args.trace_functions is not None or args.dump_mem
+    wanted = bool(args.symbols or args.trace_functions or args.dump_mem
                   or args.inject)
     game = None
     if targets:
-        logging.basicConfig(format="%(message)s")
-        logging.getLogger("macrt").setLevel(logging.DEBUG if args.trace_traps else logging.INFO)
         try:
             for f, view in targets:
                 p = display.launch(f.name, viewer_main if view else None, app=f,
@@ -537,7 +546,7 @@ def main(argv=None) -> int:
                     game = p
         except (MemoryError, ValueError) as e:
             display.shutdown(quit_app=False)
-            print(f"macrt: {e}", file=sys.stderr)
+            log.error("%s", e)
             return 2
     else:
         display.launch("Sampler", sampler_main)
@@ -545,9 +554,9 @@ def main(argv=None) -> int:
             display.launch("Ticker", ticker_main)
     if wanted:
         if game is None:
-            print("macrt: symbol tracing needs a 68k application to run", file=sys.stderr)
+            log.error("symbol tracing needs a 68k application to run")
         elif not _wait_loaded(app, display):
-            print("macrt: the application did not load in time", file=sys.stderr)
+            log.error("the application did not load in time")
         else:
             table = _get_symbols(args, game.app, progress=_extract_progress
                                  if args.symbols and not os.path.exists(args.symbols)
@@ -557,21 +566,17 @@ def main(argv=None) -> int:
             functions, meta = table
             if args.dump_mem:
                 n = game.dump_memory(args.dump_mem)
-                print(f"macrt: wrote {n // 65536} MB of Mac memory to {args.dump_mem}")
-            if args.trace_functions is not None:
+                log.info("wrote %d MB of Mac memory to %s", n // 65536, args.dump_mem)
+            if args.trace_functions:
                 match = tuple(s.strip() for s in args.trace_match.split(",") if s.strip())
-                out = sys.stderr
-                if args.trace_functions:
-                    out = open(args.trace_functions, "w")
                 try:
                     display.bridge.call(
-                        lambda: symtab.symbols_for(game, functions, meta, match, out))
+                        lambda: symtab.symbols_for(game, functions, meta, match))
                 except ValueError as e:
-                    print(f"macrt: {e}", file=sys.stderr)
+                    log.error(e)
                     return 2
-                print(f"macrt: tracing {len(functions)} functions"
-                      f"{' into ' + args.trace_functions if args.trace_functions else ''}"
-                      " (hooks go on as the game runs)")
+                log.info("tracing %d functions (hooks go on as the game runs)",
+                         len(functions))
             if args.inject:
                 # Hand the symbols to the controller the script will get,
                 # so it can hook and call by Ghidra name without loading

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import logging
 import re
 import struct
 import sys
@@ -39,6 +40,7 @@ from typing import IO, Callable, Iterator
 
 from unicorn import UC_HOOK_CODE
 
+from . import ansi
 from .memory import ADDRESS_MASK
 from .resfork import open_fork
 
@@ -387,19 +389,20 @@ def load_symbols(path: str) -> tuple[list[dict], dict]:
 
 
 def symbols_for(process, table: list[dict], meta: dict | None = None,
-                match: tuple[str, ...] = (), out=None) -> "FunctionTracer":
+                match: tuple[str, ...] = ()) -> "FunctionTracer":
     """Trace the process's own functions -- name, arguments, return
     value -- against a symbol table extracted from Ghidra.  A table
     extracted here records the application it came from (its jank A5,
     which every resource the dump was built from adds up to); a table
     for another version is refused rather than let mislabel the log.
-    The hooks go on as the guest next stops in its event loop."""
+    The lines go to the log; the hooks go on as the guest next stops in
+    its event loop."""
     layout = jank_layout(process.app.rsrc)
     if meta and meta.get("jank_a5") is not None and meta["jank_a5"] != layout.jank_a5:
         raise ValueError(
             f"the symbol table is for another application "
             f"(its dump's A5 {meta['jank_a5']:#x}, this app's {layout.jank_a5:#x})")
-    return process.trace_functions(table, match, out)
+    return process.trace_functions(table, match)
 
 
 # ---------------------------------------------------------------------------
@@ -585,11 +588,10 @@ class FunctionTracer:
     (`wait(lambda: not tracer.pending)`)."""
 
     def __init__(self, process, app_map: AppMap, table: list[dict],
-                 out: IO[str] | None = None, match: tuple[str, ...] = ()):
+                 match: tuple[str, ...] = ()):
         self.process = process
         self.app_map = app_map
         self.table = table
-        self.out = out or sys.stderr
         self.match = tuple(match)
         self.depth = 0
         self._calls: list[str] = []               # call lines awaiting their return
@@ -598,6 +600,7 @@ class FunctionTracer:
         self._installed: set[int] = set()         # jank entries hooked
         self._drop = False                        # uninstall queued
         self._qlock = threading.Lock()            # the queue: any thread, pump's thread
+        self.log = logging.getLogger("macrt.func")
         # A sorted index of the table for naming addresses: the routine
         # whose entry is the greatest one at or below an address, if the
         # address is inside its body.
@@ -677,12 +680,6 @@ class FunctionTracer:
             self.pending.clear()
             self._drop = True
 
-    def log(self, line: str) -> None:
-        """A line from elsewhere in the runtime (a trap trace) onto the
-        trace's own writer, so the two kinds interleave in order."""
-        self.out.write(line + "\n")
-        if hasattr(self.out, "flush"):
-            self.out.flush()
 
     def _return_sites(self, sym: dict, entry: int) -> list[int]:
         return return_sites(self.app_map, sym, entry)
@@ -766,6 +763,5 @@ class FunctionTracer:
                 break
         if call is None:
             call, caller = f"{sym['name']}(?)", ""
-        self.out.write(f"{self.process.name}: func {call} -> {value}{caller}\n")
-        if self.depth == 0 and hasattr(self.out, "flush"):
-            self.out.flush()
+        self.log.debug(f"{self.process.name}: func {call} -> {value}{caller}",
+                       extra={"trace": "func"})

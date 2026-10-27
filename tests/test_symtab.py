@@ -22,6 +22,7 @@ tracer, which arms while the loop runs, logs AddTwo and Twice but not
 main's own entry.
 """
 
+import logging
 import re
 import struct
 
@@ -127,6 +128,11 @@ def table(lay):
                 seg1.jank_base + len(MAIN) + len(ADDTWO) + 2,
                 ("param_1", "param_2")),
             sym("Twice", seg2.jank_base, seg2.jank_base + len(TWICE), ("param_1",))]
+
+
+def _traced(caplog) -> str:
+    """Everything the trace loggers have said, as one text."""
+    return "\n".join(r.message for r in caplog.records)
 
 
 def launch_fixture(h):
@@ -244,7 +250,7 @@ def test_map_finds_every_segment_while_it_runs(harness, jank_fixture):
     assert amap.resolve(lay.segments[2].jank_base) is None
 
 
-def test_tracer_logs_arguments_and_returns(harness, jank_fixture, tmp_path):
+def test_tracer_logs_arguments_and_returns(harness, jank_fixture, caplog):
     """The tracer arms while the fixture's loop runs and logs every
     call it resolves: the name, the arguments as they sit on the stack,
     and what came back -- across the segment boundary, from CODE 2's
@@ -253,12 +259,11 @@ def test_tracer_logs_arguments_and_returns(harness, jank_fixture, tmp_path):
     h = harness()
     proc = launch_fixture(h)
     lay = jank_fixture
-    log = tmp_path / "trace.log"
-    out = open(log, "w")
-    tr = symtab.symbols_for(proc, table(lay), {"jank_a5": lay.jank_a5}, (), out)
-    h.wait_until(lambda: "func Twice(param_1=3)" in log.read_text(), timeout=5,
-                 what="Twice traced")
-    text = log.read_text()
+    with caplog.at_level(logging.DEBUG, logger="macrt.func"):
+        tr = symtab.symbols_for(proc, table(lay), {"jank_a5": lay.jank_a5})
+        h.wait_until(lambda: "func Twice(param_1=3)" in _traced(caplog),
+                     timeout=5, what="Twice traced")
+    text = _traced(caplog)
     assert re.search(r"SymFix: func AddTwo\(param_1=3, param_2=2\) -> 5 "
                      r"\(called from \$[0-9A-F]{6} / ram:[0-9A-F]{8} @ main\+2C\)", text)
     assert re.search(r"SymFix: func Twice\(param_1=3\) -> 6 "
@@ -271,8 +276,7 @@ def test_tracer_logs_arguments_and_returns(harness, jank_fixture, tmp_path):
     when = proc.system.mem.r32(proc.partition.a5 + EVENT + 6)
     h.wait_until(lambda: proc.system.mem.r32(proc.partition.a5 + EVENT + 6) > when,
                  timeout=5, what="the guest still running after uninstall")
-    assert "AddTwo" in log.read_text()            # and the log keeps what it saw
-    out.close()
+    assert "AddTwo" in _traced(caplog)             # and the log keeps what it saw
 
 
 def test_dump_memory_matches_live_ram(harness, tmp_path):
@@ -287,7 +291,7 @@ def test_dump_memory_matches_live_ram(harness, tmp_path):
         assert data[at:at + n] == mem.read(at, n)
 
 
-def test_controller_flow(harness, jank_fixture, tmp_path):
+def test_controller_flow(harness, jank_fixture, tmp_path, caplog):
     """The automation path end to end: save a table in the extractor's
     format, load it, map a Ghidra address, trace with a name filter."""
     from macrt.ui.automation import Controller
@@ -298,7 +302,7 @@ def test_controller_flow(harness, jank_fixture, tmp_path):
     ctl = Controller(h.d)
     assert ctl.symbols() == []
     with pytest.raises(RuntimeError, match="symbol table"):
-        ctl.trace_functions(str(tmp_path / "nobody.log"))
+        ctl.trace_functions()
 
     cache = tmp_path / "syms.json"
     symtab.save_symbols(str(cache), table(lay), {"jank_a5": lay.jank_a5})
@@ -311,15 +315,15 @@ def test_controller_flow(harness, jank_fixture, tmp_path):
         symtab.AppMap(proc, lay).bases[2]
     assert ctl.map_address(lay.segments[2].jank_base) is None
 
-    log = tmp_path / "trace.log"
-    ctl.trace_functions(str(log), ("AddTwo",))
-    ctl.wait(ctl.trace_ready, timeout=5)
-    ctl.wait(lambda: re.search(
-        r"func AddTwo\(param_1=3, param_2=2\) -> 5 "
-        r"\(called from \$[0-9A-F]{6} / ram:[0-9A-F]{8} @ main\+[0-9A-F]+\)",
-        log.read_text()), timeout=5)
-    assert "Twice" not in log.read_text()        # the filter held
-    ctl.trace_stop()
+    with caplog.at_level(logging.DEBUG, logger="macrt.func"):
+        ctl.trace_functions(("AddTwo",))
+        ctl.wait(ctl.trace_ready, timeout=5)
+        ctl.wait(lambda: re.search(
+            r"func AddTwo\(param_1=3, param_2=2\) -> 5 "
+            r"\(called from \$[0-9A-F]{6} / ram:[0-9A-F]{8} @ main\+[0-9A-F]+\)",
+            _traced(caplog)), timeout=5)
+        assert "Twice" not in _traced(caplog)      # the filter held
+        ctl.trace_stop()
 
 
 def test_trap_trace_shaped_like_the_function_trace(harness, jank_fixture, caplog):

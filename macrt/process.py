@@ -216,11 +216,12 @@ class Process:
         self.thread.start()
 
     def trace_functions(self, table: list, match: tuple[str, ...] = (),
-                        out=None) -> "symtab.FunctionTracer | None":
+                        ) -> "symtab.FunctionTracer | None":
         """Trace its own 68k functions -- name, arguments, return value --
         using the jank-layout map back from Ghidra's addresses.  The
-        table's from macrt.symtab; the hooks go on as the guest stops,
-        so it takes a moment (and its event loop) to arm."""
+        table's from macrt.symtab; the lines go to the log, and the
+        hooks go on as the guest stops, so it takes a moment (and its
+        event loop) to arm."""
         from . import symtab
         if self.runner is None:
             raise ValueError(f"{self.name} has no 68k code to trace")
@@ -228,7 +229,7 @@ class Process:
             raise ValueError(f"{self.name} has no application file to map")
         layout = symtab.jank_layout(self.app.rsrc)
         app_map = symtab.AppMap(self, layout)
-        tracer = symtab.FunctionTracer(self, app_map, table, out, match)
+        tracer = symtab.FunctionTracer(self, app_map, table, match)
         tracer.install()
         self.runner.tracer = tracer
         return tracer

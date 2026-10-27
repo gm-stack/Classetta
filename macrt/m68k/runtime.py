@@ -38,7 +38,7 @@ import traceback
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Callable
 
-from .. import moof
+from .. import ansi, moof
 from ..memory import ADDRESS_MASK, BusError, from_mac, to_mac
 from ..toolbox import lowmem
 from ..toolbox.files import ERIK, File
@@ -1095,12 +1095,7 @@ class Runner:
         self._trace_trap(sig, call_text, pc)
 
     def _trace_line(self, text: str) -> None:
-        line = f"{self.process.name}: trap {text}"
-        tracer = self.tracer
-        if tracer is not None:
-            tracer.log(line)            # the app trace's writer, so lines mix in order
-        else:
-            log.debug(line)
+        log.debug(f"{self.process.name}: trap {text}", extra={"trace": "trap"})
 
     def _trace_trap(self, sig, call_text, pc: int) -> None:
         if call_text is None:

@@ -262,11 +262,10 @@ class Controller:
         layout = symtab.jank_layout(proc.app.rsrc)
         return symtab.AppMap(proc, layout).resolve(ghidra_addr)
 
-    def trace_functions(self, path: str | None = None,
-                        match: tuple[str, ...] = ()) -> int:
+    def trace_functions(self, match: tuple[str, ...] = ()) -> int:
         """Start tracing the target's own functions -- name, arguments,
-        return value -- to a file or stderr.  `match` keeps the log to
-        the routines whose names contain one of these.  The hooks go on
+        return value -- to the log.  `match` keeps the log to the
+        routines whose names contain one of these.  The hooks go on
         as the guest next stops in its event loop; `trace_ready()` says
         when they're all on.  Returns how many functions were queued."""
         from .. import symtab
@@ -275,10 +274,8 @@ class Controller:
                                "load_symbols() or extract_symbols() first")
         def start():
             proc = self._proc()
-            out = open(path, "w") if path else None
-            proc._trace_out = out
             proc._tracer = symtab.symbols_for(proc, self._symbols, self._symbols_meta,
-                                              match, out)
+                                              match)
             return True
         self.d.bridge.call(start)
         return len(self._symbols)

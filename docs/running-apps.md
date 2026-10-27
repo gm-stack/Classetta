@@ -336,6 +336,7 @@ python -m macrt FILE... [--app NAME]... [options]
 | `--list` | Lists the file's resources and exits. |
 | `--view` | Shows the application's menus, windows and dialogs from its resources, without running its code. Useful when the code won't run. |
 | `--trace-traps` | Logs every Toolbox and OS trap the application calls. |
+| `--log FILE` | Writes the whole log -- traps, function traces, everything -- to FILE as well as the screen. The screen keeps the colours; FILE gets plain text. |
 | `--system FILE` | Uses a real System file, or a disk image holding one, in place of macrt's own small one. See below. |
 | `--host desktop` | Each Mac window is a window on your desktop, with one menu bar for the front application. This is the default. |
 | `--host screen` | Everything is drawn inside one window that is the Mac's screen. |
