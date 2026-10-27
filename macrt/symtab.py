@@ -574,6 +574,38 @@ def stack_adjust(app_map: "AppMap", sym: dict, entry: int) -> int:
     return 0
 
 
+_STRING_MAX = 256                     # how far a trace will read for a string
+
+
+def _is_c_char_ptr(t: str) -> bool:
+    """Is the type Ghidra gave an argument `char *` (or `unsigned char *`),
+    i.e. a pointer to text worth showing?"""
+    t = t.replace("const", "").strip()
+    return t in ("char *", "unsigned char *", "signed char *",
+                 "uchar *", "u_char *")
+
+
+def _string_at(mem, addr: int, limit: int = _STRING_MAX) -> str | None:
+    """The string at a live address, or None if there's no telling it's
+    one: nothing NUL-terminated there, or bytes that aren't text.  An
+    empty string counts -- a pointer to a lone NUL is a real one."""
+    if not addr:
+        return None
+    out = []
+    for i in range(limit):
+        try:
+            b = mem.r8(addr + i)
+        except Exception:                                # noqa: BLE001
+            return None                         # ran off the end: not terminated
+        if b == 0:
+            return "".join(out)
+        # Printable ASCII, tab included; anything else says this isn't text.
+        if not (0x20 <= b <= 0x7E or b == 0x09):
+            return None
+        out.append(chr(b))
+    return None                         # no NUL within the limit: not terminated
+
+
 class FunctionTracer:
     """Hooks every routine the map resolves, and writes what it sees:
     each call's name and arguments as they sit on the stack, and what
@@ -697,6 +729,11 @@ class FunctionTracer:
                     return f"{value:g}"
                 return f"{value:#x}" if fmt == "I" else str(value)
             raw = mem.read(at, length)
+            if fmt == "p" and _is_c_char_ptr(p.get("type", "")):
+                value = struct.unpack(">I", raw)[0]
+                shown = f"0x{value:08X}" if value else "NULL"
+                text = _string_at(mem, value)
+                return f'{shown} "{text}"' if text is not None else shown
             return "0x" + raw.hex().upper()
         except Exception:                                # noqa: BLE001
             return "?"

@@ -214,6 +214,43 @@ class _MapOnly:
         self.layout = layout
 
 
+def test_char_pointer_arguments_show_their_strings():
+    """A `char *` argument prints its address and -- when the bytes
+    really are a NUL-terminated string -- the text after it.  A pointer
+    that isn't one (unterminated, or binary) shows its address alone."""
+    import struct as _struct
+
+    class Mem:
+        def __init__(self, blob, base):
+            self.blob, self.base = blob, base
+
+        def r8(self, a):
+            i = a - self.base
+            if not 0 <= i < len(self.blob):
+                raise RuntimeError("bus")
+            return self.blob[i]
+
+        def read(self, a, n):
+            return bytes(self.r8(a + i) for i in range(n))
+
+    base = 0x500000
+    blob = bytearray(b"hello\x00" + b"\xff\xfe" * 4 + b"\x00" * 4)
+    slots = len(blob)
+    blob += _struct.pack(">I", base) + _struct.pack(">I", base + 6) + b"\x00" * 4
+    mem = Mem(blob, base)
+    fmt = symtab.FunctionTracer._fmt
+    p = {"format": "p", "length": 4, "type": "char *"}
+    sp = base
+    assert fmt(None, mem, sp, p, slots) == f'0x{base:08X} "hello"'
+    # Not a string: binary bytes, no termination to be found in text.
+    assert fmt(None, mem, sp, p, slots + 4) == f"0x{base + 6:08X}"
+    # NULL shows as NULL, with no string of course.
+    assert fmt(None, mem, sp, p, slots + 8) == "NULL"
+    # Any other pointer type: the address, string or not.
+    assert fmt(None, mem, sp, {"format": "p", "length": 4, "type": "int *"},
+               slots) == f"0x{base:08X}"
+
+
 def test_signature_parsing():
     """What `extract_symbols` reads off a Ghidra signature: the stack
     slots each argument takes, and the return."""
