@@ -251,6 +251,84 @@ def test_char_pointer_arguments_show_their_strings():
                slots) == f"0x{base:08X}"
 
 
+def _stub_headless(tmp_path, body: str) -> str:
+    """A fake Ghidra install: a `support/analyzeHeadless` shell script
+    running `body` (it sees the real argument list, so it can check the
+    flags and write the output JSON wherever asked)."""
+    home = tmp_path / "ghidra"
+    (home / "support").mkdir(parents=True)
+    script = home / "support" / "analyzeHeadless"
+    script.write_text("#!/bin/sh\n" + body)
+    script.chmod(0o755)
+    return str(home)
+
+
+def test_headless_extraction_reads_the_project(tmp_path, jank_fixture):
+    """`extract_symbols_headless` runs Ghidra's analyzeHeadless over the
+    project read-only and with analysis off, hands the post-script its
+    output path and this application's jank A5, and returns the JSON the
+    script wrote; `finalize_rows` then parses the signatures."""
+    home = _stub_headless(tmp_path, """
+echo "$@" > "$STUB_ARGS"
+# the post-script's output path is its first argument, after its own name
+out=""
+seen=0
+for a in "$@"; do
+    if [ "$seen" = 1 ]; then out="$a"; break; fi
+    case "$a" in *ExtractSymbols.java) seen=1;; esac
+done
+printf '{"program": "the_dump", "a5": %d, "functions": [
+  {"name": "main", "entry": "00010000", "body_end": "00010060",
+   "signature": "short main(void)"},
+  {"name": "AddTwo", "entry": "0x10062", "body_end": null, "signature": null}]}' \\
+    %d > "$out"
+""" % (jank_fixture.jank_a5, jank_fixture.jank_a5))
+    (tmp_path / "stub.args").touch()
+    rows, meta = symtab.extract_symbols_headless(
+        str(tmp_path / "proj.gpr"), "the_dump", ghidra_home=home,
+        jank_a5=jank_fixture.jank_a5,
+        env={"STUB_ARGS": str(tmp_path / "stub.args")})
+    args = (tmp_path / "stub.args").read_text()
+    assert "-noanalysis" in args and "-readOnly" in args
+    assert "ExtractSymbols.java" in args
+    assert f"{jank_fixture.jank_a5:X}" in args
+    assert meta["program"] == "the_dump"
+    table = symtab.finalize_rows(rows)
+    assert [t["name"] for t in table] == ["main", "AddTwo"]
+    assert table[0]["entry"] == 0x10000 and table[0]["body_end"] == 0x10060
+    assert table[0]["return"]["format"] == "h"
+    assert table[1]["body_end"] == table[1]["entry"] + 1     # no body given
+    assert table[1]["params"] == []
+
+
+def test_headless_extraction_refuses_another_version(tmp_path):
+    """A project whose program's dump A5 is not this application's: the
+    script prints EXTRACT-MISMATCH and writes nothing, and the reader
+    says so -- the same refusal the live path made."""
+    home = _stub_headless(tmp_path, """
+echo "EXTRACT-MISMATCH a5=dead want=BEEF"
+exit 0
+""")
+    with pytest.raises(ValueError, match="matches this application"):
+        symtab.extract_symbols_headless(str(tmp_path / "proj.gpr"), "other",
+                                        ghidra_home=home, jank_a5=0xBEEF)
+
+
+def test_headless_extraction_reports_a_failed_read(tmp_path):
+    home = _stub_headless(tmp_path, """
+echo "ERROR: something Ghidra said" >&2
+exit 1
+""")
+    with pytest.raises(RuntimeError, match="symbol read failed"):
+        symtab.extract_symbols_headless(str(tmp_path / "proj.gpr"), "gone",
+                                        ghidra_home=home)
+
+
+def test_find_ghidra_needs_an_install(tmp_path):
+    with pytest.raises(FileNotFoundError, match="analyzeHeadless"):
+        symtab.find_ghidra(str(tmp_path / "not_ghidra"))
+
+
 def test_signature_parsing():
     """What `extract_symbols` reads off a Ghidra signature: the stack
     slots each argument takes, and the return."""

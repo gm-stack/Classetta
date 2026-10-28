@@ -222,32 +222,28 @@ class Controller:
         self._symbols, self._symbols_meta = symtab.load_symbols(path)
         return len(self._symbols)
 
-    def extract_symbols(self, ghidra_url: str = "http://127.0.0.1:8080/mcp",
-                        program: str | None = None, path: str | None = None,
-                        progress=None) -> int:
-        """Ask a running Ghidra for every function's name, arguments and
-        return value, and keep them.  The program is picked by matching
-        the running app's jump table, unless named.  Saves to `path`."""
+    def extract_symbols(self, project: str, program: str | None = None,
+                        path: str | None = None, progress=None,
+                        ghidra_home: str | None = None) -> int:
+        """Read every function's name, arguments and return value from a
+        saved Ghidra project (headless, read-only, no analysis), and
+        keep them.  The program is picked by matching the running app's
+        dump A5, unless named.  Saves to `path`."""
         from .. import symtab
-        mcp = symtab.GhidraMcp(ghidra_url)
-        if program is None:
-            program = self._pick_program(mcp)
-        table = symtab.extract_symbols(mcp, program, progress)
-        self._symbols = table
-        from .. import symtab as _st
-        self._symbols_meta = {"ghidra": {"program": program, "url": ghidra_url},
-                              "jank_a5": _st.jank_layout(self._proc().app.rsrc).jank_a5}
-        if path:
-            symtab.save_symbols(path, table, self._symbols_meta)
-        return len(table)
-
-    def _pick_program(self, mcp) -> str:
-        """The open Ghidra program that is the target's application."""
         proc = self._proc()
         if proc is None or proc.app is None:
             raise RuntimeError("extract_symbols needs a 68k application")
-        from .. import symtab
-        return symtab.pick_program(mcp, proc.app.rsrc)
+        layout = symtab.jank_layout(proc.app.rsrc)
+        rows, read_meta = symtab.extract_symbols_headless(
+            project, program, ghidra_home=ghidra_home, jank_a5=layout.jank_a5,
+            progress=progress)
+        self._symbols = symtab.finalize_rows(rows)
+        self._symbols_meta = {"ghidra": {"program": read_meta.get("program"),
+                                         "project": read_meta.get("project")},
+                              "jank_a5": layout.jank_a5}
+        if path:
+            symtab.save_symbols(path, self._symbols, self._symbols_meta)
+        return len(self._symbols)
 
     def symbols(self) -> list[dict]:
         return list(getattr(self, "_symbols", []))

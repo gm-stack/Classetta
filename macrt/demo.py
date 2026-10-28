@@ -333,14 +333,15 @@ def parse_args(argv=None):
     ap.add_argument("--quit-when-done", action="store_true",
                     help="with --script, shut down once the script returns")
     ap.add_argument("--ghidra-project", metavar="PATH",
-                    help="the Ghidra project the symbols come from, recorded with them; "
-                         "the symbols themselves are read from a running Ghidra "
-                         "(see --ghidra-mcp) and cached by --symbols")
+                    help="the Ghidra project (.gpr) the symbols come from, read with "
+                         "Ghidra's headless analyzer (read-only, no analysis); the "
+                         "symbols are cached by --symbols")
     ap.add_argument("--ghidra-program", metavar="NAME",
-                    help="which open Ghidra program the application is "
+                    help="which program in the Ghidra project the application is "
                          "(found on its own if not given)")
-    ap.add_argument("--ghidra-mcp", metavar="URL", default=symtab.DEFAULT_MCP_URL,
-                    help="the running Ghidra's MCP endpoint (default: %(default)s)")
+    ap.add_argument("--ghidra-home", metavar="PATH",
+                    help="where Ghidra is installed, for the headless symbol read "
+                         "(found on its own if not given)")
     ap.add_argument("--symbols", metavar="FILE",
                     help="the symbol table file: read it if it's there, otherwise ask "
                          "Ghidra and save it there")
@@ -453,24 +454,30 @@ def _extract_progress(done: int, total: int) -> None:
 
 
 def _get_symbols(args, app, progress=None) -> tuple[list[dict], dict] | None:
-    """The symbol table: the cache file if it's there, else asked of a
-    running Ghidra and saved.  The Ghidra program is the one whose jump
-    table matches the application's, unless --ghidra-program says."""
+    """The symbol table: the cache file if it's there, else read from
+    the saved Ghidra project -- headless, read-only, no analysis -- and
+    saved.  The Ghidra program is the one whose dump A5 matches the
+    application's, unless --ghidra-program says."""
     if args.symbols and os.path.exists(args.symbols):
         return symtab.load_symbols(args.symbols)
     log = logging.getLogger("macrt")
+    if not args.ghidra_project:
+        log.error("no symbol cache at %s and no --ghidra-project to read them from",
+                  args.symbols or "(no --symbols given)")
+        return None
+    layout = symtab.jank_layout(app.rsrc)
     try:
-        mcp = symtab.GhidraMcp(args.ghidra_mcp)
+        rows, read_meta = symtab.extract_symbols_headless(
+            args.ghidra_project, args.ghidra_program, ghidra_home=args.ghidra_home,
+            jank_a5=layout.jank_a5, progress=progress)
+        table = symtab.finalize_rows(rows)
     except Exception as e:                                       # noqa: BLE001
         log.error("%s", e)
         return None
-    program = args.ghidra_program or symtab.pick_program(mcp, app.rsrc)
-    log.info("reading symbols from Ghidra program %r...", program)
-    table = symtab.extract_symbols(mcp, program, progress)
-    meta = {"ghidra": {"program": program, "url": args.ghidra_mcp,
-                       "project": args.ghidra_project},
+    meta = {"ghidra": {"program": read_meta.get("program"),
+                       "project": read_meta.get("project")},
             "app": {"name": app.name},
-            "jank_a5": symtab.jank_layout(app.rsrc).jank_a5}
+            "jank_a5": layout.jank_a5}
     if args.symbols:
         symtab.save_symbols(args.symbols, table, meta)
         log.info("%d functions saved to %s", len(table), args.symbols)

@@ -18,23 +18,29 @@ table in the image, are entries of the same routine, and the offset
 word each carries says how far into its segment the routine is.
 `AppMap.resolve` does that translation.
 
-`GhidraMcp` asks a running Ghidra (the ghidrassist MCP server) for
-each function's name, arguments and return value, and `load_symbols`
-caches what it found in a JSON file, so a later run needs no Ghidra.
-`FunctionTracer` hooks every routine the map resolves and logs its
-name, its arguments as they pass on the stack, and what it returns.
+`extract_symbols_headless` reads a saved Ghidra project without needing
+a running Ghidra: it runs Ghidra's own `analyzeHeadless` with a
+read-only post-script (`ghidra/ExtractSymbols.java`, shipped here) that
+writes the already-defined symbols -- name, entry, body, signature --
+to JSON.  Nothing is re-analyzed and the project is not modified.
+`load_symbols` caches what it found in a JSON file, so a later run needs
+no Ghidra at all.  `FunctionTracer` hooks every routine the map resolves
+and logs its name, its arguments as they pass on the stack, and what it
+returns.
 """
 
 from __future__ import annotations
 
 import bisect
+import glob
 import json
 import logging
+import os
 import re
 import struct
-import sys
+import subprocess
+import tempfile
 import threading
-import urllib.request
 from dataclasses import dataclass, field
 from typing import IO, Callable, Iterator
 
@@ -47,8 +53,6 @@ from .resfork import open_fork
 SYSTEM_RAM_SIZE = 0x10000
 JT_OFFSET = 0x20                    # the jump table's offset from A5, in both worlds
 DUMMY_ADDR = 0xFFFFFFFF
-
-DEFAULT_MCP_URL = "http://127.0.0.1:8080/mcp"
 
 
 # ---------------------------------------------------------------------------
@@ -208,51 +212,95 @@ def jank_layout(rsrc: bytes) -> JankLayout:
 
 
 # ---------------------------------------------------------------------------
-# The symbols, from a running Ghidra
+# The symbols, from a saved Ghidra project
 # ---------------------------------------------------------------------------
-class GhidraMcp:
-    """The ghidrassist MCP server, over its streamable-HTTP transport:
-    a session id from initialize, then tools/call, whose answers come
-    back as SSE `data:` lines."""
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-    def __init__(self, url: str = DEFAULT_MCP_URL):
-        self.url = url
-        self._session: str | None = None
 
-    def _post(self, payload: dict) -> dict | None:
-        headers = {"Content-Type": "application/json",
-                   "Accept": "application/json, text/event-stream"}
-        if self._session:
-            headers["Mcp-Session-Id"] = self._session
-        req = urllib.request.Request(self.url, data=json.dumps(payload).encode(),
-                                     headers=headers)
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            sid = resp.headers.get("Mcp-Session-Id")
-            if sid:
-                self._session = sid
-            body = resp.read().decode()
-        for line in body.splitlines():
-            if line.startswith("data:"):
-                return json.loads(line[5:].strip())
-        return None
+def find_ghidra(home: str | None = None) -> str:
+    """The analyzeHeadless script: `home` if given, else GHIDRA_HOME,
+    else the newest ghidra* install in the usual places (Ghidra is not
+    on PATH)."""
+    if home:
+        cand = [os.path.join(home, "support", "analyzeHeadless")]
+    else:
+        env = os.environ.get("GHIDRA_HOME")
+        cand = ([os.path.join(env, "support", "analyzeHeadless")] if env else []) + \
+            sorted(glob.glob("/Applications/ghidra*/support/analyzeHeadless"),
+                   reverse=True)
+    for path in cand:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    raise FileNotFoundError(
+        "no analyzeHeadless found: install Ghidra, or pass --ghidra-home "
+        "(or set GHIDRA_HOME) to its directory")
 
-    def _connect(self) -> None:
-        if self._session is None:
-            self._post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                        "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                                   "clientInfo": {"name": "classetta", "version": "1"}}})
-            self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
-    def call(self, tool: str, **arguments) -> str:
-        """One tool's text answer."""
-        self._connect()
-        reply = self._post({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                            "params": {"name": tool, "arguments": arguments}})
-        result = (reply or {}).get("result") or {}
-        if result.get("isError"):
-            raise RuntimeError(f"{tool}: {result}")
-        return "\n".join(c.get("text", "") for c in result.get("content", [])
-                         if c.get("type") == "text")
+def extract_symbols_headless(project: str, program: str | None = None,
+                             ghidra_home: str | None = None,
+                             jank_a5: int | None = None,
+                             progress: Callable[[int, int], None]
+                             | None = None,
+                             env: dict | None = None) -> tuple[list[dict], dict]:
+    """Every function a saved Ghidra project's program holds, read
+    through `analyzeHeadless` with a read-only post-script: no analysis
+    runs and the project is not modified.  With no `program` named, the
+    one whose dump A5 (at $904, where the jank loader writes it) equals
+    `jank_a5` is chosen -- the dumps record their A5 there, so the
+    program equal to this application's was made from these same
+    resources, and a different version is refused rather than let
+    mislabel the table.  Returns
+    (rows, meta); `rows` still need `finalize_rows` to parse the
+    signatures.  Needs Java on PATH and a Ghidra install (found by
+    `find_ghidra`)."""
+    headless = find_ghidra(ghidra_home)
+    project = os.path.abspath(project)
+    # analyzeHeadless wants the project's directory and its name
+    # (the .gpr file's stem).
+    project_dir, gpr = os.path.split(project)
+    project_name = re.sub(r"\.gpr$", "", gpr)
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "symbols.json")
+        # "*" runs the script over every program in the project; each
+        # one whose A5 doesn't match says EXTRACT-MISMATCH and writes
+        # nothing, so the file only appears for the program that is
+        # this application (or the named one, alone).
+        cmd = [headless, project_dir, project_name, "-noanalysis", "-readOnly",
+               "-process", program or "*", "-noanalysis"]
+        script_args = [out] + ([f"{jank_a5:X}"] if jank_a5 is not None else [])
+        cmd += ["-postScript", os.path.join(SCRIPT_DIR, "ghidra", "ExtractSymbols.java"),
+                *script_args]
+        log = logging.getLogger("macrt")
+        log.info("reading symbols from Ghidra project %s...", project)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800,
+                                  env={**os.environ, **(env or {})})
+        except OSError as e:
+            raise RuntimeError(f"{headless}: {e} (needs a Java runtime on PATH)") from e
+        text = proc.stdout + proc.stderr
+        if not os.path.exists(out):
+            if "EXTRACT-MISMATCH" in text:
+                raise ValueError(
+                    f"no program in {gpr} matches this application "
+                    f"(jank A5 {jank_a5:#x})")
+            raise RuntimeError(
+                f"the Ghidra symbol read failed (exit {proc.returncode}):\n"
+                + _tail(text))
+        with open(out) as f:
+            data = json.load(f)
+    rows = data.get("functions", [])
+    if not rows:
+        raise RuntimeError(f"the Ghidra program {data.get('program')!r} holds no functions")
+    if progress:
+        progress(len(rows), len(rows))
+    meta = {"project": project, "program": data.get("program"),
+            "a5": data.get("a5")}
+    return rows, meta
+
+
+def _tail(text: str, lines: int = 12) -> str:
+    keep = text.strip().splitlines()[-lines:]
+    return "\n".join("  " + l for l in keep)
 
 
 # FunctionSignature types, as Ghidra names them, to (struct char, bytes).
@@ -285,8 +333,6 @@ def type_info(t: str) -> tuple[str, int]:
 
 _SIG_RE = re.compile(r"^(?P<ret>.*?)\s+(?:(?P<conv>__\w+)\s+)?"
                      r"(?P<name>[\w:]+)\s*\((?P<params>.*)\)\s*;?\s*$")
-_FUNC_RE = re.compile(r"^- (.+?) @ ([0-9a-fA-F]+) \((\d+) params\)", re.MULTILINE)
-_BODY_RE = re.compile(r"Body: \[\[([0-9a-fA-F]+),\s*([0-9a-fA-F]+)\]\]")
 
 
 def _parse_signature(sig: str) -> dict:
@@ -315,64 +361,28 @@ def _parse_signature(sig: str) -> dict:
             "params": params}
 
 
-def extract_symbols(mcp: GhidraMcp, program: str, progress: Callable[[int, int], None]
-                    | None = None) -> list[dict]:
-    """Every function in a program: name, entry, body, and what it takes
-    and returns, as Ghidra has it.  A function whose signature Ghidra
-    can't show still gets its name and address, with no parameters."""
-    listing, total = [], 0
-    offset = 0
-    while True:
-        text = mcp.call("get_functions", program_name=program, offset=offset, limit=200)
-        page = _FUNC_RE.findall(text)
-        if not page:
-            break
-        for name, addr, _n in page:
-            listing.append({"name": name, "entry": int(addr, 16)})
-        offset += len(page)
-        m = re.search(r"Showing \d+ of (\d+)", text)
-        total = int(m.group(1)) if m else total
-        if offset >= total or len(page) < 200:
-            break
+def finalize_rows(rows: list[dict],
+                  progress: Callable[[int, int], None] | None = None) -> list[dict]:
+    """The extractor's raw rows -- name, entry, body_end (hex or int),
+    signature -- with each signature parsed into the stack slots the
+    arguments take and the return.  A function whose signature Ghidra
+    never set still gets its name and address, with no parameters."""
     out = []
-    for i, item in enumerate(listing):
-        try:
-            info = mcp.call("analyze_function", function_name=item["name"],
-                            program_name=program)
-        except Exception:                                   # noqa: BLE001
-            info = ""
-        sig_line = next((l.split("Signature: ", 1)[1].strip()
-                         for l in info.splitlines() if l.startswith("Signature:")), "")
-        body = _BODY_RE.search(info)
-        row = {"name": item["name"], "entry": item["entry"],
-               "body_end": int(body.group(2), 16) if body else item["entry"] + 1,
-               "signature": sig_line}
-        row.update(_parse_signature(sig_line) if sig_line else
-                   {"return": {"type": "unknown", "format": "x", "length": 4}, "params": []})
-        out.append(row)
+    for i, row in enumerate(rows):
+        entry = row["entry"] if isinstance(row["entry"], int) else int(row["entry"], 16)
+        body = row.get("body_end")
+        body = (entry + 1 if body is None else
+                body if isinstance(body, int) else int(body, 16))
+        sig = row.get("signature") or ""
+        done = {"name": row["name"], "entry": entry, "body_end": body,
+                "signature": sig}
+        done.update(_parse_signature(sig) if sig else
+                    {"return": {"type": "unknown", "format": "x", "length": 4},
+                     "params": []})
+        out.append(done)
         if progress:
-            progress(i + 1, len(listing))
+            progress(i + 1, len(rows))
     return out
-
-
-def pick_program(mcp: GhidraMcp, rsrc: bytes) -> str:
-    """Which open Ghidra program the application is: the dumps record
-    their A5 at $904, and the one equal to this application's jank A5
-    was made from these same resources."""
-    import re as _re
-    layout = jank_layout(rsrc)
-    names = _re.findall(r"Project Path: (\S+)", mcp.call("list_binaries"))
-    for name in names:
-        try:
-            data = mcp.call("get_data_at", address="0x904", len=4, program_name=name)
-            hexdump = _re.search(r"^[0-9a-fA-F]+\s+((?:[0-9a-fA-F]{2} ){4})", data,
-                                 _re.MULTILINE)
-        except Exception:                                        # noqa: BLE001
-            continue
-        if hexdump and int(hexdump.group(1).replace(" ", ""), 16) == layout.jank_a5:
-            return name
-    raise ValueError(f"no open Ghidra program matches this application "
-                     f"(jank A5 {layout.jank_a5:#x})")
 
 
 def save_symbols(path: str, table: list[dict], meta: dict) -> None:
