@@ -323,13 +323,12 @@ def parse_args(argv=None):
                     help="a real System file, or a disk image holding one, in place of the "
                          "built-in empty one")
     ap.add_argument("--script", metavar="FILE",
-                    help="a Python file run against the running display, to drive the "
-                         "applications with synthetic keys and clicks")
-    ap.add_argument("--inject", metavar="FILE",
-                    help="a Python file run against the running display with `mac` in "
-                         "its globals: hook the game's own functions (on entry, on "
+                    help="a Python file run against the running display, with `mac` in "
+                         "its globals: drive the applications with synthetic keys and "
+                         "clicks, and/or hook the game's own functions (on entry, on "
                          "return, replaced outright), call them, and read its memory "
-                         "and registers.  Needs the symbols: --symbols or Ghidra.")
+                         "and registers.  Hooking needs the symbols: --symbols or "
+                         "Ghidra.")
     ap.add_argument("--quit-when-done", action="store_true",
                     help="with --script, shut down once the script returns")
     ap.add_argument("--ghidra-project", metavar="PATH",
@@ -418,17 +417,15 @@ def open_targets(args):
     return targets, disks, None
 
 
-def _run_script(display, path: str, quit_when_done: bool = False,
-                controller=None) -> None:
+def _run_script(display, path: str, quit_when_done: bool = False) -> None:
     """Run a Python file on its own thread, with `macrt` (the Controller),
-    `mac` (the same, for injection scripts) and `display` in its globals.
-    The GUI thread stays free to draw and answer traps while the script
-    sleeps and waits."""
+    `mac` (the same) and `display` in its globals.  The GUI thread stays
+    free to draw and answer traps while the script sleeps and waits."""
     import traceback
 
     from .ui.automation import Controller
 
-    controller = controller or Controller(display)
+    controller = getattr(display, "_controller", None) or Controller(display)
     display._controller = controller
 
     def run():
@@ -537,8 +534,6 @@ def main(argv=None) -> int:
         print(f"macrt: {e}", file=sys.stderr)
         return 2
     display.show()
-    wanted = bool(args.symbols or args.trace_functions or args.dump_mem
-                  or args.inject)
     game = None
     if targets:
         try:
@@ -559,44 +554,43 @@ def main(argv=None) -> int:
         display.launch("Sampler", sampler_main)
         if not args.single:
             display.launch("Ticker", ticker_main)
-    if wanted:
+    if args.dump_mem or args.trace_functions:
         if game is None:
-            log.error("symbol tracing needs a 68k application to run")
-        elif not _wait_loaded(app, display):
+            log.error("tracing and --dump-mem need a 68k application to run")
+            return 2
+        if not _wait_loaded(app, display):
             log.error("the application did not load in time")
-        else:
+            return 2
+        if args.dump_mem:
+            n = game.dump_memory(args.dump_mem)
+            log.info("wrote %d MB of Mac memory to %s", n // 65536, args.dump_mem)
+        if args.trace_functions:
             table = _get_symbols(args, game.app, progress=_extract_progress
                                  if args.symbols and not os.path.exists(args.symbols)
                                  else None)
             if table is None:
                 return 2
             functions, meta = table
-            if args.dump_mem:
-                n = game.dump_memory(args.dump_mem)
-                log.info("wrote %d MB of Mac memory to %s", n // 65536, args.dump_mem)
-            if args.trace_functions:
-                match = tuple(s.strip() for s in args.trace_match.split(",") if s.strip())
-                try:
-                    display.bridge.call(
-                        lambda: symtab.symbols_for(game, functions, meta, match))
-                except ValueError as e:
-                    log.error(e)
-                    return 2
-                log.info("tracing %d functions (hooks go on as the game runs)",
-                         len(functions))
-            if args.inject:
-                # Hand the symbols to the controller the script will get,
-                # so it can hook and call by Ghidra name without loading
-                # them again.  One controller for --script and --inject
-                # both, so they see the same hooks and loaded symbols.
-                from .ui.automation import Controller
-                controller = getattr(display, "_controller", None) or Controller(display)
-                controller._symbols, controller._symbols_meta = functions, meta
-                display._controller = controller
-    for path in (args.script, args.inject):
-        if path:
-            _run_script(display, path, quit_when_done=args.quit_when_done,
-                        controller=getattr(display, "_controller", None))
+            match = tuple(s.strip() for s in args.trace_match.split(",") if s.strip())
+            try:
+                display.bridge.call(
+                    lambda: symtab.symbols_for(game, functions, meta, match))
+            except ValueError as e:
+                log.error(e)
+                return 2
+            log.info("tracing %d functions (hooks go on as the game runs)",
+                     len(functions))
+    if args.script:
+        # The controller the script gets reads its symbol table lazily --
+        # on the first hook/call/name, from --symbols or the Ghidra
+        # project -- so a script that only drives the game never pays for
+        # the read.
+        from .ui.automation import Controller
+        controller = getattr(display, "_controller", None) or Controller(
+            display, symbols_file=args.symbols, ghidra_project=args.ghidra_project,
+            ghidra_program=args.ghidra_program, ghidra_home=args.ghidra_home)
+        display._controller = controller
+        _run_script(display, args.script, quit_when_done=args.quit_when_done)
     signal.signal(signal.SIGINT, lambda *_: display.shutdown())
     heartbeat = QTimer(interval=200)      # lets Python see Ctrl+C
     heartbeat.timeout.connect(lambda: None)

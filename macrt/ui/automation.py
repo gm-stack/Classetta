@@ -22,6 +22,7 @@ global, as in the test harness (conftest.Harness).
 
 from __future__ import annotations
 
+import os
 import time
 
 from PyQt6.QtCore import Qt
@@ -80,14 +81,62 @@ def parse_key(spec: str, keyboard: int = PLUS_KEYBOARD) -> tuple[int, int]:
 
 class Controller:
     """Script-facing input and observation for a Display.  Input goes to
-    the front process by default; `attach(name)` picks another."""
+    the front process by default; `attach(name)` picks another.
 
-    def __init__(self, display):
+    The symbol table is the game's own function names, from Ghidra: it
+    is what `hook`, `call` and the name-based `read`/`resolve` work
+    against.  It is not loaded up front -- the first of those says when
+    it's wanted, and it's read then, from `symbols_file` (a saved
+    table) or, failing that, the Ghidra project `ghidra_project` -- and
+    cached.  A script that only drives the game with keys and clicks
+    never pays for it."""
+
+    def __init__(self, display, symbols_file: str | None = None,
+                 ghidra_project: str | None = None, ghidra_program: str | None = None,
+                 ghidra_home: str | None = None):
         self.d = display
         self._keyboard = display.system.model.keyboard
         self._target = None
-        self._symbols: list[dict] = []
+        self._symbols: list[dict] | None = None
         self._symbols_meta: dict = {}
+        self._symbols_file = symbols_file
+        self._ghidra_project = ghidra_project
+        self._ghidra_program = ghidra_program
+        self._ghidra_home = ghidra_home
+
+    # -- the symbol table, on first use ------------------------------------
+    def _ensure_symbols(self) -> list[dict]:
+        """The table, read once and kept: from the cache file if it's
+        there, else from the Ghidra project (headless, read-only, no
+        analysis), saved to the cache file on the way.  Only the
+        symbol-using calls reach here, so a script that never touches a
+        name never triggers it."""
+        if self._symbols is not None:
+            return self._symbols
+        from .. import symtab
+        file, project = self._symbols_file, self._ghidra_project
+        if file and os.path.exists(file):
+            self._symbols, self._symbols_meta = symtab.load_symbols(file)
+            return self._symbols
+        if not project:
+            raise RuntimeError(
+                "no symbol table to read: pass --symbols (a saved table) or "
+                "--ghidra-project (to read it from Ghidra); a script that "
+                "hooks or calls by name needs one")
+        proc = self._proc()
+        if proc is None or proc.app is None:
+            raise RuntimeError("a symbol table needs a 68k application to run")
+        layout = symtab.jank_layout(proc.app.rsrc)
+        rows, read_meta = symtab.extract_symbols_headless(
+            project, self._ghidra_program, ghidra_home=self._ghidra_home,
+            jank_a5=layout.jank_a5)
+        self._symbols = symtab.finalize_rows(rows)
+        self._symbols_meta = {"ghidra": {"program": read_meta.get("program"),
+                                         "project": read_meta.get("project")},
+                              "jank_a5": layout.jank_a5}
+        if file:
+            symtab.save_symbols(file, self._symbols, self._symbols_meta)
+        return self._symbols
 
     # -- time --------------------------------------------------------------
     def sleep(self, seconds: float) -> None:
@@ -214,45 +263,17 @@ class Controller:
             proc.events.post(EventRecord(mouseUp, 0, 0, d.input.mac_pos, d.input.modifiers))
 
     # -- symbols, mapping, tracing ----------------------------------------
-    def load_symbols(self, path: str) -> int:
-        """Read a Ghidra symbol table (macrt.symtab's JSON) for the
-        target process to map and trace against.  Returns how many
-        functions it holds."""
-        from .. import symtab
-        self._symbols, self._symbols_meta = symtab.load_symbols(path)
-        return len(self._symbols)
-
-    def extract_symbols(self, project: str, program: str | None = None,
-                        path: str | None = None, progress=None,
-                        ghidra_home: str | None = None) -> int:
-        """Read every function's name, arguments and return value from a
-        saved Ghidra project (headless, read-only, no analysis), and
-        keep them.  The program is picked by matching the running app's
-        dump A5, unless named.  Saves to `path`."""
-        from .. import symtab
-        proc = self._proc()
-        if proc is None or proc.app is None:
-            raise RuntimeError("extract_symbols needs a 68k application")
-        layout = symtab.jank_layout(proc.app.rsrc)
-        rows, read_meta = symtab.extract_symbols_headless(
-            project, program, ghidra_home=ghidra_home, jank_a5=layout.jank_a5,
-            progress=progress)
-        self._symbols = symtab.finalize_rows(rows)
-        self._symbols_meta = {"ghidra": {"program": read_meta.get("program"),
-                                         "project": read_meta.get("project")},
-                              "jank_a5": layout.jank_a5}
-        if path:
-            symtab.save_symbols(path, self._symbols, self._symbols_meta)
-        return len(self._symbols)
-
     def symbols(self) -> list[dict]:
-        return list(getattr(self, "_symbols", []))
+        """The table's rows: it's read on first use (see
+        `_ensure_symbols`), so this is what triggers the read."""
+        return list(self._ensure_symbols())
 
     def map_address(self, ghidra_addr: int):
         """Where Ghidra's address `ghidra_addr` is in Classetta's memory
-        right now, or None if its segment isn't loaded.  Needs
-        `load_symbols` (or `extract_symbols`) first -- that is what says
-        this application is the one Ghidra looked at."""
+        right now, or None if its segment isn't loaded.  Reads the table
+        on first use -- it says this application is the one Ghidra
+        looked at."""
+        self._ensure_symbols()
         proc = self._proc()
         from .. import symtab
         layout = symtab.jank_layout(proc.app.rsrc)
@@ -265,9 +286,7 @@ class Controller:
         as the guest next stops in its event loop; `trace_ready()` says
         when they're all on.  Returns how many functions were queued."""
         from .. import symtab
-        if not self._symbols:
-            raise RuntimeError("trace_functions needs a symbol table: "
-                               "load_symbols() or extract_symbols() first")
+        self._ensure_symbols()
         def start():
             proc = self._proc()
             proc._tracer = symtab.symbols_for(proc, self._symbols, self._symbols_meta,
@@ -330,13 +349,17 @@ class Controller:
         direct."""
         from .. import inject
         if isinstance(target, int):
-            for sym in self._symbols:
-                if sym["entry"] == target:
-                    return sym
+            # A bare address can be called without the table (symbol_at);
+            # only look up its row if the table is already in hand.
+            if self._symbols is not None:
+                for sym in self._symbols:
+                    if sym["entry"] == target:
+                        return sym
             return inject.symbol_at(target)
+        symbols = self._ensure_symbols()
         name = str(target)
-        exact = [s for s in self._symbols if s["name"] == name]
-        hits = exact or [s for s in self._symbols if name.lower() in s["name"].lower()]
+        exact = [s for s in symbols if s["name"] == name]
+        hits = exact or [s for s in symbols if name.lower() in s["name"].lower()]
         if len(hits) > 1:
             layout = self._patcher().app_map.layout
             real = [s for s in hits if not layout.is_jt_slot(s["entry"])]

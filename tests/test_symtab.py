@@ -407,21 +407,24 @@ def test_dump_memory_matches_live_ram(harness, tmp_path):
 
 
 def test_controller_flow(harness, jank_fixture, tmp_path, caplog):
-    """The automation path end to end: save a table in the extractor's
-    format, load it, map a Ghidra address, trace with a name filter."""
+    """The automation path end to end: no table configured says so on
+    first use; a table pointed at by `symbols_file` is read lazily, then
+    a Ghidra address is mapped and traced with a name filter."""
     from macrt.ui.automation import Controller
 
     h = harness()
     proc = launch_fixture(h)
     lay = jank_fixture
     ctl = Controller(h.d)
-    assert ctl.symbols() == []
-    with pytest.raises(RuntimeError, match="symbol table"):
+    with pytest.raises(RuntimeError, match="no symbol table"):
+        ctl.symbols()
+    with pytest.raises(RuntimeError, match="no symbol table"):
         ctl.trace_functions()
 
     cache = tmp_path / "syms.json"
     symtab.save_symbols(str(cache), table(lay), {"jank_a5": lay.jank_a5})
-    assert ctl.load_symbols(str(cache)) == 3
+    ctl = Controller(h.d, symbols_file=str(cache))
+    assert len(ctl.symbols()) == 3
     functions, meta = symtab.load_symbols(str(cache))
     assert meta["jank_a5"] == lay.jank_a5
     assert [f["name"] for f in functions] == ["main", "AddTwo", "Twice"]

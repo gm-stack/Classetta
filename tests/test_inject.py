@@ -259,10 +259,10 @@ def test_call_and_helpers_through_the_controller(harness, jank_fixture, tmp_path
     proc = launch_fixture(h)
     a5, mem = proc.partition.a5, proc.system.mem
     lay = jank_fixture
-    ctl = Controller(h.d)
     cache = tmp_path / "syms.json"
     symtab.save_symbols(str(cache), table(lay), {"jank_a5": lay.jank_a5})
-    assert ctl.load_symbols(str(cache)) == 3
+    ctl = Controller(h.d, symbols_file=str(cache))
+    assert len(ctl.symbols()) == 3
 
     out = []
     ctl.call_async(lambda: out.append(ctl.call("Twice", (21,))))
@@ -292,11 +292,10 @@ def test_controller_decorator_end_to_end(harness, jank_fixture, tmp_path):
     h = harness()
     proc = launch_fixture(h)
     a5, mem = proc.partition.a5, proc.system.mem
-    ctl = Controller(h.d)
     cache = tmp_path / "syms.json"
     symtab.save_symbols(str(cache), table(jank_fixture),
                         {"jank_a5": jank_fixture.jank_a5})
-    ctl.load_symbols(str(cache))
+    ctl = Controller(h.d, symbols_file=str(cache))
 
     @ctl.hook("Twice", phase="replace")
     def twice(hook):
