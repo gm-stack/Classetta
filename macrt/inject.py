@@ -63,7 +63,9 @@ import traceback
 from collections import deque
 from typing import Any, Callable
 
-from unicorn import UC_HOOK_CODE
+from unicorn import (UC_HOOK_CODE, UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE,
+                     UC_MEM_READ, UC_MEM_WRITE)
+from unicorn.m68k_const import UC_M68K_REG_PC
 
 from . import symtab
 from .memory import ADDRESS_MASK
@@ -237,6 +239,57 @@ class FunctionHook:
         return f"<FunctionHook {self.phase} {self.name}{where}>"
 
 
+class Watchpoint:
+    """A memory access to one address, recorded as it happens.
+
+    The address is a Ghidra address; the live one is found as the
+    segment loads, the same way a function hook's is, and the unicorn
+    memory hook goes on then.  A 68k `MOVE.L` that writes the whole
+    slot containing the watched byte fires once, with the access's base
+    address and size, so the value is the word or long it wrote.
+
+    Observe-only: the handler, if any, runs inside unicorn's memory
+    hook, mid-instruction, on the guest thread.  It may read registers
+    and memory, but must not stop the core, write memory, or call 68k
+    code -- the instruction is still in flight.  `events` holds the
+    accesses as (kind, addr, size, value, pc, ghidra_pc), newest last,
+    capped at `max_events`; `pc` is the live PC and `ghidra_pc` the
+    address Ghidra would name it, None outside the application.
+    """
+
+    __slots__ = ("patcher", "jank_addr", "size", "mode", "handler",
+                 "live_addr", "handles", "installed", "events", "max_events",
+                 "_to_remove")
+
+    def __init__(self, patcher: "FunctionPatcher", jank_addr: int, size: int,
+                 mode: str, handler: Callable | None, max_events: int):
+        if mode not in ("read", "write", "both"):
+            raise ValueError(f"mode is one of read, write, both, not {mode!r}")
+        if size not in (1, 2, 4):
+            raise ValueError(f"size is 1, 2 or 4, not {size!r}")
+        self.patcher = patcher
+        self.jank_addr = jank_addr
+        self.size = size
+        self.mode = mode
+        self.handler = handler
+        self.live_addr: int | None = None
+        self.handles: list[int] = []
+        self.installed = False
+        self.events: list[tuple] = []
+        self.max_events = max_events
+        self._to_remove = False
+
+    def uninstall(self) -> None:
+        self.patcher._schedule_unwatch(self)
+
+    def clear(self) -> None:
+        self.events.clear()
+
+    def __repr__(self) -> str:
+        where = f" at {self.live_addr:#x}" if self.live_addr is not None else " (pending)"
+        return f"<Watchpoint {self.mode} {self.jank_addr:#x}{where}>"
+
+
 class FunctionPatcher:
     """The hook engine for one running process.  `hook` registers a
     hook; `pump`, which the Runner calls at every instruction stop,
@@ -252,9 +305,11 @@ class FunctionPatcher:
         self.cpu = process.runner.cpu
         self.mem = process.system.mem
         self.hooks: list[FunctionHook] = []
+        self.watchpoints: list[Watchpoint] = []
         self._answers: deque = deque()        # stopped calls awaiting pump
         self._async: deque = deque()
         self._to_remove: list[FunctionHook] = []
+        self._to_unwatch: list[Watchpoint] = []
         self._qlock = threading.Lock()
 
     # -- registering ---------------------------------------------------------
@@ -271,6 +326,26 @@ class FunctionPatcher:
         with self._qlock:
             if fh not in self._to_remove:
                 self._to_remove.append(fh)
+        self.wake()
+
+    def watch(self, jank_addr: int, size: int = 1, mode: str = "write",
+              handler: Callable | None = None, max_events: int = 1024) -> Watchpoint:
+        """Record the accesses to one address as the guest makes them.
+        `jank_addr` is a Ghidra address; the live one is found as the
+        segment loads, and the hook goes on then.  `mode` is read, write
+        or both; `size` the access's width, 1, 2 or 4 -- a wider access
+        that reaches the address fires once, with its own base and size.
+        Observe-only: see `Watchpoint`."""
+        wp = Watchpoint(self, jank_addr, size, mode, handler, max_events)
+        with self._qlock:
+            self.watchpoints.append(wp)
+        self.wake()
+        return wp
+
+    def _schedule_unwatch(self, wp: Watchpoint) -> None:
+        with self._qlock:
+            if wp not in self._to_unwatch:
+                self._to_unwatch.append(wp)
         self.wake()
 
     @property
@@ -295,6 +370,9 @@ class FunctionPatcher:
             todo_remove, self._to_remove = self._to_remove, []
             todo_install = [fh for fh in self.hooks
                             if not fh.installed and fh not in todo_remove]
+            todo_unwatch, self._to_unwatch = self._to_unwatch, []
+            todo_watch = [wp for wp in self.watchpoints
+                          if not wp.installed and wp not in todo_unwatch]
             answers, self._answers = list(self._answers), deque()
             todo_async, self._async = self._async, deque()
         changed = False
@@ -304,11 +382,18 @@ class FunctionPatcher:
                 if fh in self.hooks:
                     self.hooks.remove(fh)
             changed = True
-        if todo_install:
+        if todo_install or todo_watch:
             self.app_map.refresh()      # segments loaded since last look
-            for fh in todo_install:
-                if self._install(fh):
-                    changed = True
+        for fh in todo_install:
+            if self._install(fh):
+                changed = True
+        for wp in todo_unwatch:
+            self._unwatch(wp)
+            with self._qlock:
+                if wp in self.watchpoints:
+                    self.watchpoints.remove(wp)
+        for wp in todo_watch:
+            self._install_watch(wp)
         if changed:
             cpu.uc.ctl_flush_tb()       # blocks translated before wouldn't hook
         for stop in answers:
@@ -342,6 +427,47 @@ class FunctionPatcher:
         fh.installed = False
         fh._resume = None
 
+    # -- memory watchpoints ---------------------------------------------------
+    def _install_watch(self, wp: Watchpoint) -> bool:
+        at = self.app_map.resolve(wp.jank_addr)
+        if at is None:                        # its segment isn't loaded yet
+            return False
+        wp.live_addr = at
+        uc = self.cpu.uc
+        begin = at                            # the watched bytes, exactly
+        end = begin + wp.size
+        if wp.mode in ("write", "both"):
+            wp.handles.append(uc.hook_add(UC_HOOK_MEM_WRITE, self._mem, wp, begin, end))
+        if wp.mode in ("read", "both"):
+            wp.handles.append(uc.hook_add(UC_HOOK_MEM_READ, self._mem, wp, begin, end))
+        wp.installed = True
+        return True
+
+    def _unwatch(self, wp: Watchpoint) -> None:
+        for h in wp.handles:
+            self.cpu.uc.hook_del(h)
+        wp.handles.clear()
+        wp.installed = False
+        wp.live_addr = None
+
+    def _mem(self, uc, access: int, address: int, size: int, value: int,
+             wp: Watchpoint) -> None:
+        """A 68k access that reached the watched address: record it.  Runs
+        inside unicorn, mid-instruction, on the guest thread -- read the
+        PC and, if set, run the handler, but don't stop the core."""
+        pc = uc.reg_read(UC_M68K_REG_PC) & ADDRESS_MASK
+        kind = "write" if access == UC_MEM_WRITE else "read"
+        ghidra_pc = self.app_map.ghidra_at(pc)
+        with self._qlock:
+            wp.events.append((kind, address, size, value, pc, ghidra_pc))
+            if len(wp.events) > wp.max_events:
+                del wp.events[:len(wp.events) - wp.max_events]
+        if wp.handler is not None:
+            try:
+                wp.handler(kind, address, size, value, pc, ghidra_pc)
+            except Exception:                                   # noqa: BLE001
+                traceback.print_exc()
+
     def shutdown(self) -> None:
         """Take every hook off, as the application ends.  The hooks are
         on a shared core, so they go off with the machine held: if this
@@ -350,10 +476,12 @@ class FunctionPatcher:
         way a process switch does -- and gives it back after."""
         with self._qlock:
             all_hooks, self.hooks = self.hooks, []
+            all_wps, self.watchpoints = self.watchpoints, []
             self._answers.clear()
             self._async.clear()
             self._to_remove.clear()
-        if not all_hooks:
+            self._to_unwatch.clear()
+        if not all_hooks and not all_wps:
             return
         runner = self.runner
         took = not runner.holding
@@ -362,6 +490,8 @@ class FunctionPatcher:
         try:
             for fh in all_hooks:
                 self._unhook(fh)
+            for wp in all_wps:
+                self._unwatch(wp)
             self.cpu.uc.ctl_flush_tb()
         finally:
             if took:
