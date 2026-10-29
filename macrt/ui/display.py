@@ -364,6 +364,10 @@ class Display(QObject):
             out.close()
         if self.tracker is not None:
             self.tracker.cancel()
+        # Closed rather than hidden, so it lets go of the processor it may
+        # be holding before the applications are killed.
+        if getattr(self, "debugger", None) is not None:
+            self.debugger.close()
         for proc in self.processes:
             proc.kill()
         app = QApplication.instance()

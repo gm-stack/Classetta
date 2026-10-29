@@ -529,6 +529,217 @@ def _clock(cpu: weakref.ref[CPU], closed: threading.Event) -> None:
         del held
 
 
+class Debug:
+    """A debugger's hold on the core, shared between the GUI (which asks)
+    and the guest thread (which does).
+
+    Neither may touch the core when the other is at it: while the guest
+    thread is inside emu_start, the core's registers belong to it.  So the
+    GUI never reads the core -- it only leaves a note (request_pause,
+    request_step, request_go) -- and the guest thread reads that note at a
+    safe point between two instructions where it runs Python anyway: at each
+    trap, and every SLICE instructions while a debugger is attached (see
+    debug_slicing).  There it does what was asked:
+
+      to stop   it copies the registers and the code around the PC into
+                `view`, says it has, and waits;
+      to step   one more instruction runs (arm_step stops the core after
+                it, wherever it goes), and it stops again;
+      to go     the application runs on, still watched, so the window can
+                stop it again;
+
+    When the window goes away (detach) the core is let go for good and
+    run() stops coming back so often.
+
+    Because a pause takes effect at the next safe point rather than at a
+    chosen instruction, where it lands isn't exact -- which suits a pause
+    button.  A breakpoint, which would stop at an exact place, is another
+    thing and isn't here yet.
+
+    `view` is a copy rather than a window on live state, taken with the
+    core known at rest.  The GUI reads it whenever it likes, even after the
+    application has run on.  Everything about what's asked and what's done
+    is kept under one condition variable, so a request can't be missed
+    between the guest thread's look and its wait.
+    """
+
+    BACK, AHEAD = 10, 5           # instructions of listing before and after the PC
+
+    def __init__(self, cpu: CPU, dead=lambda: False):
+        self.cpu = cpu
+        self.dead = dead          # the process being killed: don't hold it then
+        self.attached = False     # a debugger window is looking at this core
+        self.stopped = False      # held for the debugger, view ready
+        self._want = None         # "pause", "step" or "go", from the GUI
+        self._pending = False     # asked to stop, but a trap is half-run: hold when it's done
+        self._detach = False      # the window's gone: the guest thread takes the hook off
+        self._cv = threading.Condition()
+        self.view: dict | None = None
+
+    # -- the GUI's side: leave a note, don't touch the core -------------------
+    def attach(self) -> None:
+        """A debugger window has opened on this core.  run() comes back every
+        SLICE instructions from now on, so a pause asked for while the code
+        runs free doesn't wait out a loop that calls no trap."""
+        self.attached, self._detach = True, False
+        self.cpu.debug_slicing = True
+
+    def detach(self) -> None:
+        """The debugger window is gone.  Let a held core run again at once;
+        the step hook, if one is armed, comes off on the guest thread at its
+        next stop -- unicorn's hooks belong to the thread running the core --
+        and only then does run() stop coming back so often.  The hook itself
+        does nothing while detached, so nothing stops in the meantime."""
+        self._detach = True
+        with self._cv:
+            self.attached = False
+            self._want = None
+            self.stopped = False
+            self._cv.notify_all()
+        self.wake()             # an app asleep waiting for an event has to be
+                                # woken to reach the stop that unhooks this
+
+    def request_pause(self) -> None:
+        with self._cv:
+            self._want = "pause"
+        self.wake()
+
+    def wake(self) -> None:
+        """Nudge an application asleep waiting for an event, so its loop
+        turns and reaches a safe point soon instead of sleeping out its
+        timeout.  Only when it's waiting: one running its own code is
+        reaching a safe point anyway, and a null event it isn't expecting
+        would be one to explain away.  The null event is what the hook
+        engine posts for the same reason."""
+        runner = self.cpu.debug_runner
+        if runner is None or runner.holding:
+            return
+        from ..toolbox.events import EventRecord
+        from ..toolbox.types import Point
+        try:
+            runner.process.events.post(EventRecord(0, 0, 0, Point(0, 0), 0))
+        except Exception:                                       # noqa: BLE001
+            pass
+
+    def request_step(self) -> None:
+        """One more instruction, then stop again.  Only means anything while
+        held; the GUI offers it only then."""
+        with self._cv:
+            if self.stopped:
+                self._want = "step"
+                self._cv.notify_all()
+
+    def request_go(self) -> None:
+        with self._cv:
+            self._want = "go"
+            self._cv.notify_all()
+
+    def is_stopped(self) -> bool:
+        with self._cv:
+            return self.stopped
+
+    def get_view(self) -> dict | None:
+        with self._cv:
+            return self.view
+
+    # -- the guest thread's side, between two instructions --------------------
+    def pump(self, outermost: bool = True) -> None:
+        """The Runner calls this after every stop of the core, where the
+        core is at rest and this thread is free.  `outermost` says whether
+        the application's own code is what's running: a trap's Python may
+        run 68k of its own through a nested loop, and holding there would
+        leave that trap half-answered -- so what's asked for there is
+        remembered instead, and done once the loop unwinds.
+
+        A step's stop is looked at first.  Its instruction has run -- a
+        trap, then, with the whole of what it called done, and the PC on
+        the instruction after it -- and the core is held again there."""
+        if self._detach:
+            self.cpu.disarm_step()
+            self.cpu.dbg_fired = False      # a stop between the window's going
+            self.cpu.debug_slicing = False  # and this: nothing to act on now
+            self._pending = False
+            return
+        if self.cpu.dbg_fired:
+            self.cpu.dbg_fired = False
+            self.cpu.disarm_step()          # one stop per step, whatever happens
+            if outermost:
+                self._hold()
+            else:
+                self._pending = True
+            return
+        with self._cv:
+            want, self._want = self._want, None
+        if want == "pause":
+            self._pending = True
+        if self._pending and outermost:
+            self._pending = False
+            self._hold()
+
+    def _hold(self) -> None:
+        """Stopped for the debugger: take its numbers, let the GUI know, and
+        wait for what to do next.  Woken for a step or a go, or by the window
+        going away; woken by the process being killed, which outranks all."""
+        self.snapshot()
+        with self._cv:
+            self.stopped = True
+            self._cv.notify_all()
+            while self.stopped:
+                if self._want == "step":
+                    self._want = None
+                    self.stopped = False
+                    self.cpu.arm_step()     # the core is at rest: safe here
+                    return
+                if self._want == "go" or self._detach or not self.attached:
+                    self._want = None
+                    self.stopped = False
+                    return
+                if self.dead():
+                    self.stopped = False
+                    self._want = None
+                    return
+                self._cv.wait(0.1)
+
+    def snapshot(self) -> None:
+        """The registers, the flags and the listing around the PC, copied
+        out of the core and the guest's memory.  Called with the core at
+        rest, so these reads are safe and consistent."""
+        from . import disasm              # here, to keep capstone off cpu's imports
+        cpu, mem = self.cpu, self.cpu.mem
+        pc, sr = cpu.pc, cpu.sr
+        pat = mem.physical(pc)            # the bytes; the addresses shown stay virtual
+        listing = disasm.window(mem._b, pat, self.BACK, self.AHEAD, shift=pc - pat)
+        view = {"pc": pc, "sp": cpu.sp, "sr": sr,
+                "d": [cpu.d(n) for n in range(8)],
+                "a": [cpu.a(n) for n in range(7)],
+                "flags": ccr_names(sr),
+                "listing": listing}
+        name = self.symbol(pc)
+        if name:
+            view["symbol"] = name
+        self.view = view
+
+    def symbol(self, pc: int) -> str | None:
+        """The routine around the PC, when a symbol table is already to
+        hand: a debugger looking at the PC shouldn't set off a Ghidra read.
+        The Runner names itself as the one to ask, through debug_runner."""
+        runner = self.cpu.debug_runner
+        tracer = getattr(runner, "tracer", None) if runner is not None else None
+        if tracer is None:
+            return None
+        dump = tracer.app_map.ghidra_at(pc)
+        return tracer.symbol_at(dump) if dump is not None else None
+
+
+def ccr_names(sr: int) -> dict:
+    """SR, pulled apart for the register panel: the five condition codes,
+    the mode, and the interrupt level."""
+    return {"X": bool(sr & CCR_X), "N": bool(sr & CCR_N), "Z": bool(sr & CCR_Z),
+            "V": bool(sr & CCR_V), "C": bool(sr & CCR_C),
+            "supervisor": bool(sr & SUPERVISOR), "trace": bool(sr & T1),
+            "irq": (sr & INTERRUPT_MASK) >> 8}
+
+
 class CPU:
     def __init__(self, mem: RAM):
         self.mem = mem
@@ -561,6 +772,12 @@ class CPU:
         self._until = 0                     # where the core's running to
         self._step: int | None = None       # a write to SR to run alone, stopped at
         self._stepping = False              # running one instruction
+        self.dbg_hook = None                # the debugger's step hook, when armed
+        self.dbg_from = 0                   # the instruction the step began at
+        self.dbg_fired = False              # it stopped the core
+        self.dbg_at = 0                     # the instruction it stopped before
+        self.debug_slicing = False          # a debugger is watching: come back often
+        self.debug_runner = None            # the Runner, so a debugger can name the PC
         # Whether T1 may be set: reading SR to see is slow, and T1 is set
         # only by a write to SR, which the core is stopped at, an RTE or
         # Python.
@@ -914,7 +1131,7 @@ class CPU:
             return Event("interrupted", pc)
         self._event = None
         rate = self._rate
-        slicing = self._interrupted_at_ticks()
+        slicing = self._interrupted_at_ticks() or self.debug_slicing
         if slicing:
             self._ticked = time.monotonic()
         elif self._counting and time.monotonic() - self._ticked < LINGER:
@@ -1094,9 +1311,13 @@ class CPU:
     def _interrupted_at_ticks(self) -> bool:
         """Whether there's something to do at each tick: a VBL task
         counting down, a Time Manager task waiting, the application's own
-        interrupt handler, or a sound to make or play."""
-        return (self.vbl_counting() or self.timers_waiting() or self.own_interrupt_handler()
-                or bool(self.own_level_1_routines()) or self.sound_waiting())
+        interrupt handler, or a sound to make or play.  The clock asks this
+        before flagging a tick for run() to look at, so it says only what
+        run() would then find to do: a debugger watching isn't in it, since
+        run() slices for that itself (debug_slicing) and the clock has
+        nothing to do for it."""
+        return (self.vbl_counting() or self.timers_waiting() or self.own_interrupts()
+                or self.sound_waiting())
 
     def vbl_counting(self) -> bool:
         """Whether a task in the VBL queue is counting down to run.  One
@@ -1158,6 +1379,41 @@ class CPU:
         thread, but the instruction it stops in may run again after."""
         self.interrupt_requested = True
         self.uc.emu_stop()
+
+    # =====================================================================
+    # Single-stepping, for the debugger
+    # =====================================================================
+    # emu_stop() from another thread can't stop the core between two
+    # instructions: the core looks for a stop after each load and store and
+    # goes back to the start of the instruction it's in, whose stores are
+    # already made (see the module's docstring).  A UC_HOOK_CODE callback
+    # runs before an instruction, so stopping there leaves the registers and
+    # memory exactly as that instruction will find them: the machine between
+    # two instructions, which is where a debugger looks.  arm_step() puts
+    # such a hook on; it must be called with the core between blocks (in the
+    # Runner's pump), and so must disarm_step().  It stops after the
+    # instruction the PC is on when armed: the hook fires at that instruction
+    # first (skipped, so it runs) and stops at the next boundary.  So one
+    # instruction runs, whether it's an ordinary one or a trap that run()
+    # takes to Python; when the core stops, dbg_fired says so and dbg_at is
+    # the instruction the PC is at, which run() returns as for any stop.
+    def arm_step(self) -> None:
+        self.dbg_from, self.dbg_fired, self.dbg_at = self.pc, False, 0
+        if self.dbg_hook is None:
+            self.dbg_hook = self.uc.hook_add(UC_HOOK_CODE, self._dbg_stop)
+            self.uc.ctl_flush_tb()      # blocks translated before wouldn't call it
+
+    def disarm_step(self) -> None:
+        if self.dbg_hook is not None:
+            self.uc.hook_del(self.dbg_hook)
+            self.dbg_hook = None
+            self.uc.ctl_flush_tb()
+
+    def _dbg_stop(self, uc, addr, _size, _data) -> None:
+        if addr == self.dbg_from and not self.dbg_fired:
+            return                      # the instruction under the step: let it run
+        self.dbg_fired, self.dbg_at = True, addr
+        uc.emu_stop()
 
     def _intr(self, uc, intno, _data) -> None:
         pc = self.pc

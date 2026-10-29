@@ -357,6 +357,10 @@ def parse_args(argv=None):
     ap.add_argument("--dump-mem", metavar="FILE",
                     help="write the Mac's whole RAM to FILE once the application "
                          "has loaded")
+    ap.add_argument("--debug", action="store_true",
+                    help="open a window watching the 68k processor: pause it and "
+                         "single-step it, with its registers and the code around "
+                         "the program counter")
     args = ap.parse_args(argv)
     if args.memory is not None and args.memory <= 0:
         ap.error("--memory is a size in K, more than 0")
@@ -580,6 +584,12 @@ def main(argv=None) -> int:
                 return 2
             log.info("tracing %d functions (hooks go on as the game runs)",
                      len(functions))
+    if args.debug:
+        # It watches the processor, which there is once an application's 68k
+        # code starts; opened before that, it says so and starts watching as
+        # soon as there's anything to watch.
+        from .ui.debugger import open_debugger
+        open_debugger(display)
     if args.script:
         # The controller the script gets reads its symbol table lazily --
         # on the first hook/call/name, from --symbols or the Ghidra

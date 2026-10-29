@@ -53,7 +53,7 @@ from . import cpu as m68k
 from . import decompressors, dispatch, timemgr, wdefs
 from .sound import ASC, ASC_BASE, SoundDriver, Speaker, gestaltHasASC, vSndEnb
 from .sound_manager import SoundManager
-from .cpu import CPU
+from .cpu import CPU, Debug
 from .cycles import RATE
 from .hardware import (IWM, IWM_BASE, VIA, VIA_BASE, Clock, map_empty, map_test_rom, vBufA,
                        vBufB, vHeadSel)
@@ -309,6 +309,12 @@ class Machine:
         self.mem = system.mem
         self.owner: Runner | None = None    # before the CPU's clock asks after its timers
         self.cpu = CPU(system.mem)
+        # A debugger's hold on the processor.  There is one per machine, as
+        # there is one processor: holding it holds whichever application has
+        # it, which is what pausing means here.
+        self.debug = Debug(self.cpu, dead=lambda: (
+            self.cpu.debug_runner is not None
+            and self.cpu.debug_runner.process.events.killed))
         self.clock = Clock()                # the VIA's and the drives', the same
         self.via = VIA(button=lambda: not self.mem.r8(lowmem.MBState) & 0x80, clock=self.clock)
         self.via.map(self.cpu.uc)
@@ -609,6 +615,7 @@ class Machine:
             runner.process.world.switch_in()
             runner.catch_up = min(runner.catch_up, MAX_RETRACES)   # another's turn
             self.owner = runner
+        self.cpu.debug_runner = runner      # so a debugger can name the PC
 
     def release(self) -> None:
         self._lock.release()
@@ -665,6 +672,13 @@ def machine_for(system: System) -> Machine:
         return m
 
 
+def machine_exists(system: System) -> bool:
+    """Whether there's a processor to look at: there is one from the moment
+    some application's 68k code starts, and not before -- a session of Python
+    guests alone has none.  Nothing makes one here: a viewer asks."""
+    return getattr(system, "machine", None) is not None
+
+
 def finder_information(documents: list[tuple[int, File]]) -> bytes:
     """What the Finder tells an application it launches: the message, the
     count, then each document's working directory, type, version and name
@@ -719,6 +733,7 @@ class Runner:
         self.ticks_failed = False   # a tick while it waited went wrong
         self.time_tasks = timemgr.TimeTasks()
         self.in_wdef = 0            # how deep in calls to its own WDEFs
+        self._in_run_until = 0      # how deep in run_until: the debugger holds at the top
         process.events.enabled = lambda: self.mem.r16(lowmem.SysEvtMask)
 
     # =====================================================================
@@ -829,9 +844,23 @@ class Runner:
     # Running code
     # =====================================================================
     def run_until(self, until: int, pc: int | None = None) -> None:
-        cpu = self.cpu
+        """Run the application's code until PC reaches `until`.  A trap is
+        answered here, and the debugger holds here: at the outermost level
+        only, since a trap's own Python code may run 68k code through a
+        nested loop (a filter procedure, a WDEF), and holding in the middle
+        of that would leave the trap half-done."""
+        cpu, dbg = self.cpu, self.machine.debug
         if pc is not None:
             cpu.pc = pc
+        events = self.process.events
+        self._in_run_until += 1
+        try:
+            self._run_until(until, dbg)
+        finally:
+            self._in_run_until -= 1
+
+    def _run_until(self, until: int, dbg) -> None:
+        cpu = self.cpu
         events = self.process.events
         while True:
             ev = cpu.run(until)
@@ -851,6 +880,7 @@ class Runner:
                 else:
                     self._trap(ev.code, ev.pc)
             elif kind == "until":
+                self._held(dbg)         # a pause still holds, even at the end
                 return
             elif kind == "interrupted":
                 cpu.interrupt_requested = False
@@ -863,6 +893,18 @@ class Runner:
             else:
                 raise SystemError68k(1, f"unicorn error {ev.code} at ${ev.pc:06X} "
                                         "(an access outside RAM?)", ev.pc)
+            # After the event this stop was for, with the trap answered:
+            # where a pause holds the core, and a single step takes hold of
+            # the instruction the PC is on now.  Held, it waits here and
+            # this thread does nothing until it's told to go on.
+            self._held(dbg)
+
+    def _held(self, dbg) -> None:
+        """The debugger's look at the core, at the one place it's safe to
+        hold: between two instructions, at the top level, with no trap half
+        answered.  With nothing asked it does nothing, and no cost."""
+        if self.cpu.debug_slicing:
+            dbg.pump(outermost=self._in_run_until == 1)
 
     def _vertical_retrace(self) -> None:
         """The vertical retrace interrupt, between two instructions: count
