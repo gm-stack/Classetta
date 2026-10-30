@@ -360,7 +360,8 @@ def parse_args(argv=None):
     ap.add_argument("--debug", action="store_true",
                     help="open a window watching the 68k processor: pause it and "
                          "single-step it, with its registers and the code around "
-                         "the program counter")
+                         "the program counter; --symbols also names the routine "
+                         "the PC sits in (names only, no trace hooks)")
     args = ap.parse_args(argv)
     if args.memory is not None and args.memory <= 0:
         ap.error("--memory is a size in K, more than 0")
@@ -558,32 +559,47 @@ def main(argv=None) -> int:
         display.launch("Sampler", sampler_main)
         if not args.single:
             display.launch("Ticker", ticker_main)
-    if args.dump_mem or args.trace_functions:
-        if game is None:
+    if args.dump_mem or args.trace_functions or args.debug:
+        if game is None and (args.trace_functions or args.dump_mem):
             log.error("tracing and --dump-mem need a 68k application to run")
             return 2
-        if not _wait_loaded(app, display):
-            log.error("the application did not load in time")
-            return 2
-        if args.dump_mem:
-            n = game.dump_memory(args.dump_mem)
-            log.info("wrote %d MB of Mac memory to %s", n // 65536, args.dump_mem)
-        if args.trace_functions:
-            table = _get_symbols(args, game.app, progress=_extract_progress
-                                 if args.symbols and not os.path.exists(args.symbols)
-                                 else None)
-            if table is None:
+        if game is not None:
+            # --debug with no 68k application is no error: the window opens
+            # anyway, and starts watching as soon as there's anything to watch.
+            if not _wait_loaded(app, display):
+                log.error("the application did not load in time")
                 return 2
-            functions, meta = table
-            match = tuple(s.strip() for s in args.trace_match.split(",") if s.strip())
-            try:
-                display.bridge.call(
-                    lambda: symtab.symbols_for(game, functions, meta, match))
-            except ValueError as e:
-                log.error(e)
-                return 2
-            log.info("tracing %d functions (hooks go on as the game runs)",
-                     len(functions))
+            if args.dump_mem:
+                n = game.dump_memory(args.dump_mem)
+                log.info("wrote %d MB of Mac memory to %s", n // 65536, args.dump_mem)
+            table = None
+            if args.trace_functions or args.debug:
+                table = _get_symbols(args, game.app, progress=_extract_progress
+                                     if args.symbols and not os.path.exists(args.symbols)
+                                     else None)
+                if table is None and args.trace_functions:
+                    return 2
+            if args.trace_functions:
+                functions, meta = table
+                match = tuple(s.strip() for s in args.trace_match.split(",")
+                              if s.strip())
+                try:
+                    display.bridge.call(
+                        lambda: symtab.symbols_for(game, functions, meta, match))
+                except ValueError as e:
+                    log.error(e)
+                    return 2
+                log.info("tracing %d functions (hooks go on as the game runs)",
+                         len(functions))
+            elif table is not None:
+                # --debug without --trace-functions: the debugger names the PC,
+                # so the table is read -- but names only, no trace hooks on it.
+                functions, meta = table
+                try:
+                    display.bridge.call(lambda: symtab.names_for(game, functions, meta))
+                except ValueError as e:
+                    log.error(e)
+                    return 2
     if args.debug:
         # It watches the processor, which there is once an application's 68k
         # code starts; opened before that, it says so and starts watching as

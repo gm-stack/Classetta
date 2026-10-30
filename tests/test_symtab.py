@@ -25,6 +25,7 @@ main's own entry.
 import logging
 import re
 import struct
+import time
 
 import pytest
 
@@ -186,6 +187,36 @@ def test_symbols_for_refuses_another_version(jank_fixture):
 
     with pytest.raises(ValueError, match="another application"):
         symtab.symbols_for(Holder(), [], {"jank_a5": 0x1234})
+
+
+def test_names_for_refuses_another_version(jank_fixture):
+    """The debugger's names come under the same guard as the tracer's:
+    a table for another version would mislabel the window the same way
+    it would the log."""
+    class Holder:
+        app = fixture_app()
+
+    with pytest.raises(ValueError, match="another application"):
+        symtab.names_for(Holder(), [], {"jank_a5": 0x1234})
+
+
+def test_names_without_tracing(harness, jank_fixture, caplog):
+    """--debug alone: the table names the routine the PC sits in, with no
+    tracer and no hooks -- the guest's calls stay out of the log."""
+    h = harness()
+    proc = launch_fixture(h)
+    lay = jank_fixture
+    with caplog.at_level(logging.DEBUG, logger="macrt.func"):
+        namer = symtab.names_for(proc, table(lay), {"jank_a5": lay.jank_a5})
+        assert proc.runner.namer is namer
+        assert proc.runner.tracer is None
+        seg1 = lay.segments[0]
+        live = namer.app_map.resolve(seg1.jank_base)       # where main is now
+        assert live is not None
+        assert namer.symbol_at(namer.app_map.ghidra_at(live)) == "main"
+        assert namer.symbol_at(namer.app_map.ghidra_at(live + 2)) == "main+2"
+        time.sleep(0.3)                                    # the fixture's loop
+    assert "func " not in _traced(caplog)
 
 
 def test_jump_table_slots_are_not_traced(jank_fixture):

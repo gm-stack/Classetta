@@ -365,9 +365,10 @@ class Display(QObject):
         if self.tracker is not None:
             self.tracker.cancel()
         # Closed rather than hidden, so it lets go of the processor it may
-        # be holding before the applications are killed.
+        # be holding before the applications are killed.  force_close is the
+        # debugger's way of being closed at all: it refuses the user's X.
         if getattr(self, "debugger", None) is not None:
-            self.debugger.close()
+            self.debugger.force_close()
         for proc in self.processes:
             proc.kill()
         app = QApplication.instance()

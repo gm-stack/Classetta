@@ -119,7 +119,8 @@ from contextlib import contextmanager
 from typing import Callable, Iterator, NamedTuple
 
 from unicorn import (UC_ARCH_M68K, UC_HOOK_BLOCK, UC_HOOK_CODE, UC_HOOK_EDGE_GENERATED,
-                     UC_HOOK_INTR, UC_HOOK_TLB_FILL, UC_MEM_FETCH, UC_MEM_WRITE, UC_MODE_BIG_ENDIAN,
+                     UC_HOOK_INTR, UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE, UC_HOOK_TLB_FILL,
+                     UC_MEM_FETCH, UC_MEM_READ, UC_MEM_WRITE, UC_MODE_BIG_ENDIAN,
                      UC_PROT_ALL, UC_PROT_EXEC, UC_PROT_READ, UC_PROT_WRITE, UC_TLB_VIRTUAL, Uc,
                      UcError)
 from unicorn.unicorn_const import UC_CTL_IO_WRITE, UC_CTL_TLB_FLUSH
@@ -554,7 +555,9 @@ class Debug:
     Because a pause takes effect at the next safe point rather than at a
     chosen instruction, where it lands isn't exact -- which suits a pause
     button.  A breakpoint, which would stop at an exact place, is another
-    thing and isn't here yet.
+    thing: it's a hook the core stops on (see the bp_ methods and
+    refresh_hooks), and the stop is exact, at the instruction or access the
+    breakpoint is on.
 
     `view` is a copy rather than a window on live state, taken with the
     core known at rest.  The GUI reads it whenever it likes, even after the
@@ -575,14 +578,30 @@ class Debug:
         self._detach = False      # the window's gone: the guest thread takes the hook off
         self._cv = threading.Condition()
         self.view: dict | None = None
+        self.reason = ""          # why the core is held: the GUI's log says it
+        # Breakpoints.  The GUI adds and removes them (the bp_ methods); the
+        # guest thread turns them into unicorn's hooks at its next safe point
+        # (refresh_hooks, called from pump when _bp_dirty is set).
+        self.bp_addr: set[int] = set()       # an instruction's address
+        self.bp_trap: set[int] = set()       # a trap's key, by the word's name or number
+        self.bp_memr: set[int] = set()       # a data read, at an address
+        self.bp_memw: set[int] = set()       # a data write, at an address
+        self._bp_handles: list[int] = []     # the unicorn hooks the set has made
+        self._bp_skip: dict[int, bool] = {}  # stops whose instruction is about to re-run
+        self._bp_stop_addr: int | None = None    # a breakpoint's stop, its address
+        self._bp_dirty = False               # the set has changed: refresh at the next pump
 
     # -- the GUI's side: leave a note, don't touch the core -------------------
     def attach(self) -> None:
         """A debugger window has opened on this core.  run() comes back every
         SLICE instructions from now on, so a pause asked for while the code
-        runs free doesn't wait out a loop that calls no trap."""
+        runs free doesn't wait out a loop that calls no trap.  Breakpoints
+        kept while a previous window was closed are armed again: the window
+        going away took their hooks off."""
         self.attached, self._detach = True, False
         self.cpu.debug_slicing = True
+        if self.bp_addr or self.bp_memr or self.bp_memw or self.bp_trap:
+            self._bp_dirty = True
 
     def detach(self) -> None:
         """The debugger window is gone.  Let a held core run again at once;
@@ -642,7 +661,104 @@ class Debug:
         with self._cv:
             return self.view
 
+    def get_reason(self) -> str:
+        """Why the core is held, for the window's log: a pause, a step, or a
+        breakpoint that fired.  Empty while it runs free."""
+        with self._cv:
+            return self.reason
+
+    # -- breakpoints: the GUI's side, leave a note -----------------------------
+    # The GUI adds and removes breakpoints here; the guest thread turns them
+    # into unicorn's hooks at its next safe point (refresh_hooks, from pump).
+    # The sets are read and written under the condition variable, so a change
+    # can't be missed between the GUI's note and the guest thread's look.
+    def _bp_mutate(self, fn) -> None:
+        with self._cv:
+            fn()
+            self._bp_dirty = True
+
+    def add_bp_addr(self, addr: int) -> None:
+        self._bp_mutate(lambda: self.bp_addr.add(addr & 0xFFFFFF))
+
+    def clear_bp_addr(self, addr: int) -> None:
+        self._bp_mutate(lambda: self.bp_addr.discard(addr & 0xFFFFFF))
+
+    def add_bp_trap(self, key: int) -> None:
+        self._bp_mutate(lambda: self.bp_trap.add(key))
+
+    def clear_bp_trap(self, key: int) -> None:
+        self._bp_mutate(lambda: self.bp_trap.discard(key))
+
+    def add_bp_memr(self, addr: int) -> None:
+        self._bp_mutate(lambda: self.bp_memr.add(addr & 0xFFFFFF))
+
+    def clear_bp_memr(self, addr: int) -> None:
+        self._bp_mutate(lambda: self.bp_memr.discard(addr & 0xFFFFFF))
+
+    def add_bp_memw(self, addr: int) -> None:
+        self._bp_mutate(lambda: self.bp_memw.add(addr & 0xFFFFFF))
+
+    def clear_bp_memw(self, addr: int) -> None:
+        self._bp_mutate(lambda: self.bp_memw.discard(addr & 0xFFFFFF))
+
+    def bp_list(self) -> list[str]:
+        """The breakpoints, one line each, for the window's list.  In the
+        order the window wants them: by address, then trap, then memory,
+        a read before a write at the same address."""
+        with self._cv:
+            lines = [f"b   ${a:06X}" for a in sorted(self.bp_addr)]
+            lines += [f"bt  _{self._trap_name(k)}" for k in sorted(self.bp_trap)]
+            lines += [f"bmr ${a:06X}" for a in sorted(self.bp_memr)]
+            lines += [f"bmw ${a:06X}" for a in sorted(self.bp_memw)]
+            return lines
+
+    def _trap_name(self, key: int) -> str:
+        from . import dispatch
+        return dispatch.trap_name(key)
+
     # -- the guest thread's side, between two instructions --------------------
+    def refresh_hooks(self, seed: int | None = None) -> None:
+        """Turn the breakpoint sets into unicorn's hooks, and take the old
+        ones off.  Called from pump, with the core between blocks, so the
+        hooks are safe to add and remove -- and from the end of a hold, so a
+        breakpoint added, or cleared, while held takes effect the moment the
+        core runs again.  `seed` is the address the hold is releasing: the
+        core rewinds to the start of the instruction it stopped in, so the
+        hook there must let that one run (see arm_bp_code).  A code hook is
+        only seen by the core when its block is translated, so a flush
+        follows; blocks taken out with a hook must go too."""
+        for handle in self._bp_handles:
+            self.cpu.disarm_bp(handle)
+        self._bp_handles = []
+        skip = self._bp_skip = {}       # the old hooks are gone; their skip goes with them
+        if seed is not None:
+            skip[seed] = True
+        for addr in self.bp_addr:
+            self._bp_handles.append(self.cpu.arm_bp_code(addr, skip))
+        for addr in self.bp_memr:
+            self._bp_handles.append(self.cpu.arm_bp_mem(addr, "read", skip))
+        for addr in self.bp_memw:
+            self._bp_handles.append(self.cpu.arm_bp_mem(addr, "write", skip))
+        self.cpu.flush_code()
+        self._bp_dirty = False
+
+    def trap_hit(self, word: int) -> bool:
+        """Whether a trap breakpoint is set on this trap: by its key, so a
+        break on _WaitNextEvent catches every word that is one."""
+        from . import dispatch
+        return dispatch.trap_key(word) in self.bp_trap
+
+    def hold_trap(self, word: int) -> None:
+        """Hold the core at a trap, before it's answered: the snapshot is
+        taken with the PC on the trap's instruction, and the registers as
+        they were before it ran.  After the hold, the trap is answered by
+        the caller, as when a pause lands there.  A trap answers with
+        Python, not 68k, so there's no instruction for the core to rewind
+        to and no seed: a breakpoint added while held arms as it releases."""
+        from . import dispatch
+        self.reason = f"Breakpoint on trap _{self._trap_name(dispatch.trap_key(word))}"
+        self._hold()
+
     def pump(self, outermost: bool = True) -> None:
         """The Runner calls this after every stop of the core, where the
         core is at rest and this thread is free.  `outermost` says whether
@@ -657,29 +773,69 @@ class Debug:
         if self._detach:
             self.cpu.disarm_step()
             self.cpu.dbg_fired = False      # a stop between the window's going
-            self.cpu.debug_slicing = False  # and this: nothing to act on now
+            self.cpu.dbg_bp_fired = False   # and this: nothing to act on now
+            self.cpu.debug_slicing = False
             self._pending = False
+            self._bp_stop_addr = None
+            if self._bp_handles:            # the window's gone: so are its hooks
+                self._bp_dirty = False
+                self.refresh_hooks()
             return
-        if self.cpu.dbg_fired:
+        step_fired = self.cpu.dbg_fired
+        bp_fired = self.cpu.dbg_bp_fired
+        if self._bp_dirty and not (bp_fired or step_fired):
+            self.refresh_hooks()            # a breakpoint changed: arm it now
+        if step_fired:
             self.cpu.dbg_fired = False
+            self.cpu.dbg_bp_fired = False   # a breakpoint hit during a step is the step's
             self.cpu.disarm_step()          # one stop per step, whatever happens
+            self.reason = ""                # a step needs no word said: the
+                                            # window moving on is the news
+            self._bp_stop_addr = None
             if outermost:
                 self._hold()
             else:
                 self._pending = True
             return
+        if bp_fired:
+            self.cpu.dbg_bp_fired = False
+            self.reason = self.cpu.dbg_bp_reason
+            # The instruction or access this stop was on: the core rewinds to
+            # it, so when the hold releases its hook must let that one run.
+            self._bp_stop_addr = self.cpu.dbg_bp_addr
+            with self._cv:
+                if self._want == "pause":
+                    self._want = None       # the breakpoint satisfied a pause asked for
+            if outermost:
+                self._hold(self._bp_stop_addr)
+            else:
+                self._pending = True
+            return
         with self._cv:
             want, self._want = self._want, None
-        if want == "pause":
+        if want == "pause" and not self._pending:
             self._pending = True
+            self.reason = "Pause pressed"
+            self._bp_stop_addr = None
+        # else: a stop is already pending -- a breakpoint's, kept waiting on
+        # a half-run trap -- and it outranks a pause asked for since: the
+        # core stops either way, at the breakpoint, and its seed must stay.
         if self._pending and outermost:
             self._pending = False
-            self._hold()
+            seed, self._bp_stop_addr = self._bp_stop_addr, None
+            self._hold(seed)              # a breakpoint's stop, kept waiting on
+                                          # a trap: it seeds the hook the same
 
-    def _hold(self) -> None:
+    def _hold(self, seed: int | None = None) -> None:
         """Stopped for the debugger: take its numbers, let the GUI know, and
         wait for what to do next.  Woken for a step or a go, or by the window
-        going away; woken by the process being killed, which outranks all."""
+        going away; woken by the process being killed, which outranks all.
+
+        Breakpoints changed while held are armed as the hold releases, so
+        what was typed takes effect the moment the core runs again: `seed`,
+        for a stop a code or memory breakpoint made, is its address -- the
+        core rewinds to the instruction it stopped in, and its hook must let
+        that one run rather than stopping on it again (see arm_bp_code)."""
         self.snapshot()
         with self._cv:
             self.stopped = True
@@ -689,16 +845,18 @@ class Debug:
                     self._want = None
                     self.stopped = False
                     self.cpu.arm_step()     # the core is at rest: safe here
-                    return
+                    break
                 if self._want == "go" or self._detach or not self.attached:
                     self._want = None
                     self.stopped = False
-                    return
+                    break
                 if self.dead():
                     self.stopped = False
                     self._want = None
-                    return
+                    break
                 self._cv.wait(0.1)
+        if self._bp_dirty:
+            self.refresh_hooks(seed)
 
     def snapshot(self) -> None:
         """The registers, the flags and the listing around the PC, copied
@@ -709,26 +867,52 @@ class Debug:
         pc, sr = cpu.pc, cpu.sr
         pat = mem.physical(pc)            # the bytes; the addresses shown stay virtual
         listing = disasm.window(mem._b, pat, self.BACK, self.AHEAD, shift=pc - pat)
+        # Low memory proper, not a World's side copy: the core is stopped
+        # while its own process is the active one, so what's at $910 is
+        # the name of the application that's actually running.
+        raw = mem.read(lowmem.CurApName, 32)
         view = {"pc": pc, "sp": cpu.sp, "sr": sr,
                 "d": [cpu.d(n) for n in range(8)],
                 "a": [cpu.a(n) for n in range(7)],
                 "flags": ccr_names(sr),
+                "app_name": raw[1:1 + min(raw[0], 31)].decode("mac_roman", "replace"),
                 "listing": listing}
         name = self.symbol(pc)
         if name:
             view["symbol"] = name
+        view["symbols"] = self.symbols_loaded()     # so the log can say so
         self.view = view
+
+    def symbols_loaded(self) -> bool:
+        """Whether a symbol table is to hand to name the PC with: there is
+        one when a function tracer read it (--trace-functions), or when
+        the debugger asked for names alone (--debug)."""
+        runner = self.cpu.debug_runner
+        if runner is None:
+            return False
+        return (getattr(runner, "tracer", None) is not None or
+                getattr(runner, "namer", None) is not None)
 
     def symbol(self, pc: int) -> str | None:
         """The routine around the PC, when a symbol table is already to
         hand: a debugger looking at the PC shouldn't set off a Ghidra read.
-        The Runner names itself as the one to ask, through debug_runner."""
+        The Runner names itself as the one to ask, through debug_runner;
+        the tracer and the debug-only namer carry the same map."""
         runner = self.cpu.debug_runner
-        tracer = getattr(runner, "tracer", None) if runner is not None else None
-        if tracer is None:
+        if runner is None:
             return None
-        dump = tracer.app_map.ghidra_at(pc)
-        return tracer.symbol_at(dump) if dump is not None else None
+        names = getattr(runner, "tracer", None)
+        if names is None:
+            names = getattr(runner, "namer", None)
+        if names is None:
+            return None
+        app_map = names.app_map
+        dump = app_map.ghidra_at(pc)
+        if dump is None:
+            # A segment loaded since the map was made would explain it.
+            app_map.refresh()
+            dump = app_map.ghidra_at(pc)
+        return names.symbol_at(dump) if dump is not None else None
 
 
 def ccr_names(sr: int) -> dict:
@@ -776,6 +960,9 @@ class CPU:
         self.dbg_from = 0                   # the instruction the step began at
         self.dbg_fired = False              # it stopped the core
         self.dbg_at = 0                     # the instruction it stopped before
+        self.dbg_bp_fired = False           # a breakpoint hook stopped the core
+        self.dbg_bp_reason = ""             # why: the debugger's log says it
+        self.dbg_bp_addr = None             # the breakpoint that fired, its address
         self.debug_slicing = False          # a debugger is watching: come back often
         self.debug_runner = None            # the Runner, so a debugger can name the PC
         # Whether T1 may be set: reading SR to see is slow, and T1 is set
@@ -1414,6 +1601,47 @@ class CPU:
             return                      # the instruction under the step: let it run
         self.dbg_fired, self.dbg_at = True, addr
         uc.emu_stop()
+
+    # -- breakpoints, for the debugger ------------------------------------------
+    # A breakpoint's hook stops the core before the instruction (or at the
+    # access) it's on, for the Runner's pump to hold it there.  Like the step
+    # hook, it must be added and removed with the core between blocks (in the
+    # pump), so it's done there, not on the GUI's thread.
+    #
+    # The core re-runs the instruction it stopped at once resumed: a code
+    # breakpoint would then stop again on the same instruction, and a memory
+    # breakpoint on the same access.  So each hook remembers the address it
+    # last stopped at, and lets that one through once -- the instruction runs
+    # and the breakpoint is ready for the next time it's reached.
+    def arm_bp_code(self, addr: int, skip: dict) -> int:
+        """A hook that stops before the instruction at addr.  `skip` holds,
+        by address, the stops whose instruction the core is about to run
+        again -- the hook lets that one through, since the core rewinds to
+        the start of the instruction it stopped in.  Returns the handle."""
+        def stop(uc, at, _size, _data) -> None:
+            if skip.pop(addr, None):
+                return                      # the re-run of the one it stopped at: let it run
+            skip[addr] = True
+            self.dbg_bp_fired, self.dbg_bp_addr = True, addr
+            self.dbg_bp_reason = "Breakpoint hit"
+            uc.emu_stop()
+        return self.uc.hook_add(UC_HOOK_CODE, stop, begin=addr, end=addr)
+
+    def arm_bp_mem(self, addr: int, kind: str, skip: dict) -> int:
+        """A hook that stops at a data read or write at addr.  `kind` is
+        "read" or "write".  Returns the handle."""
+        htype = UC_HOOK_MEM_READ if kind == "read" else UC_HOOK_MEM_WRITE
+        def stop(uc, _access, at, _size, _value, _data) -> None:
+            if skip.pop(addr, None):
+                return                      # the re-run of the access it stopped at: let it run
+            skip[addr] = True
+            self.dbg_bp_fired, self.dbg_bp_addr = True, addr
+            self.dbg_bp_reason = f"Breakpoint on {kind} of ${addr:06X}"
+            uc.emu_stop()
+        return self.uc.hook_add(htype, stop, begin=addr, end=addr + 1)
+
+    def disarm_bp(self, handle: int) -> None:
+        self.uc.hook_del(handle)
 
     def _intr(self, uc, intno, _data) -> None:
         pc = self.pc

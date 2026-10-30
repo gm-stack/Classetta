@@ -398,21 +398,68 @@ def load_symbols(path: str) -> tuple[list[dict], dict]:
     return data["functions"], data.get("meta", {})
 
 
-def symbols_for(process, table: list[dict], meta: dict | None = None,
-                match: tuple[str, ...] = ()) -> "FunctionTracer":
-    """Trace the process's own functions -- name, arguments, return
-    value -- against a symbol table extracted from Ghidra.  A table
-    extracted here records the application it came from (its jank A5,
-    which every resource the dump was built from adds up to); a table
-    for another version is refused rather than let mislabel the log.
-    The lines go to the log; the hooks go on as the guest next stops in
-    its event loop."""
-    layout = jank_layout(process.app.rsrc)
+def _check_version(layout: "JankLayout", meta: dict | None) -> None:
+    """A table extracted for another application -- its jank A5, which
+    every resource the dump was built from adds up to, is different --
+    is refused rather than let mislabel anything."""
     if meta and meta.get("jank_a5") is not None and meta["jank_a5"] != layout.jank_a5:
         raise ValueError(
             f"the symbol table is for another application "
             f"(its dump's A5 {meta['jank_a5']:#x}, this app's {layout.jank_a5:#x})")
+
+
+def symbols_for(process, table: list[dict], meta: dict | None = None,
+                match: tuple[str, ...] = ()) -> "FunctionTracer":
+    """Trace the process's own functions -- name, arguments, return
+    value -- against a symbol table extracted from Ghidra.  A table
+    for another version is refused (see `_check_version`).
+    The lines go to the log; the hooks go on as the guest next stops in
+    its event loop."""
+    _check_version(jank_layout(process.app.rsrc), meta)
     return process.trace_functions(table, match)
+
+
+def index_of(table: list[dict]) -> "SymbolIndex":
+    """The table's naming half, without the tracer: the debugger wants
+    to say what routine the PC sits in, and nothing of the hooks, the
+    logging, or the arguments the tracer puts on them."""
+    return SymbolIndex(sorted((s["entry"], s.get("body_end") or 0, s["name"])
+                              for s in table if s.get("entry")))
+
+
+def names_for(process, table: list[dict],
+              meta: dict | None = None) -> "SymbolIndex":
+    """Name the process's own addresses against a symbol table, with no
+    tracing: the debugger's `--debug` half.  The same guard as
+    `symbols_for` -- a table for another version would mislabel the
+    window the same way it would the log."""
+    layout = jank_layout(process.app.rsrc)
+    _check_version(layout, meta)
+    namer = SymbolIndex(index_of(table).syms, AppMap(process, layout))
+    process.runner.namer = namer
+    return namer
+
+
+class SymbolIndex:
+    """Names for dump addresses: the routine whose entry is the greatest
+    one at or below an address, if the address is inside its body.
+    FunctionTracer keeps one of these, and asks it the same questions;
+    this is the asking, without the tracing."""
+
+    def __init__(self, syms: list[tuple], app_map=None):
+        self.syms = syms
+        self.app_map = app_map          # live <-> dump, when there's a process behind it
+
+    def symbol_at(self, addr: int) -> str | None:
+        """`Name` or `Name+offset` for an address in the dump, or None
+        when the table knows no routine it sits in (data, or code
+        Ghidra never made a function of)."""
+        i = bisect.bisect_right(self.syms, (addr, 0xFFFFFFFF, "")) - 1
+        if i >= 0:
+            entry, body_end, name = self.syms[i]
+            if entry <= addr < body_end:
+                return name if addr == entry else f"{name}+{addr - entry:X}"
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -643,22 +690,11 @@ class FunctionTracer:
         self._drop = False                        # uninstall queued
         self._qlock = threading.Lock()            # the queue: any thread, pump's thread
         self.log = logging.getLogger("macrt.func")
-        # A sorted index of the table for naming addresses: the routine
-        # whose entry is the greatest one at or below an address, if the
-        # address is inside its body.
-        self._syms = sorted((s["entry"], s.get("body_end") or 0, s["name"])
-                            for s in table if s.get("entry"))
+        # A sorted index of the table for naming addresses.
+        self.index = index_of(table)
 
     def symbol_at(self, addr: int) -> str | None:
-        """`Name` or `Name+offset` for an address in the dump, or None
-        when the table knows no routine it sits in (data, or code
-        Ghidra never made a function of)."""
-        i = bisect.bisect_right(self._syms, (addr, 0xFFFFFFFF, "")) - 1
-        if i >= 0:
-            entry, body_end, name = self._syms[i]
-            if entry <= addr < body_end:
-                return name if addr == entry else f"{name}+{addr - entry:X}"
-        return None
+        return self.index.symbol_at(addr)
 
     def _wanted(self, sym: dict) -> bool:
         if not self.match:

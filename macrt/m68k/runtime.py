@@ -718,6 +718,7 @@ class Runner:
         self.trace = False
         self.trace_suppress = ()    # trap names --trace-traps doesn't log
         self.tracer = None          # symtab.FunctionTracer, when one is installed
+        self.namer = None           # symtab.SymbolIndex, when only names were asked for
         self._trace_app_map = None  # the trap trace's map, made on first need
         self.patcher = None         # inject.FunctionPatcher, when hooks are on
         self.menu_rect = 0          # mbRect's answer while MenuSelect pulls a menu down
@@ -878,6 +879,14 @@ class Runner:
                 if self._own_a_line(ev.pc):
                     cpu.take_exception(m68k.LINE_A, ev.pc)
                 else:
+                    # A breakpoint on this trap holds the core at it, before
+                    # it's answered: the window sees the PC on the trap's
+                    # instruction, and the registers as they were before it
+                    # ran.  Only at the top level, as a pause: a trap's own
+                    # Python may run 68k of its own, and holding there would
+                    # leave it half-done.
+                    if self._in_run_until == 1 and dbg.trap_hit(ev.code):
+                        dbg.hold_trap(ev.code)
                     self._trap(ev.code, ev.pc)
             elif kind == "until":
                 self._held(dbg)         # a pause still holds, even at the end
@@ -1165,6 +1174,8 @@ class Runner:
         tracer = self.tracer
         if tracer is not None:
             return tracer.app_map
+        if self.namer is not None:
+            return self.namer.app_map
         if getattr(self, "_trace_app_map", None) is None:
             from .. import symtab
             self._trace_app_map = symtab.AppMap(
